@@ -19,6 +19,7 @@
 15. [Testing](#testing)
 16. [CI/CD](#cicd)
 17. [Deployment](#deployment)
+18. [Design Patterns, SOLID, OOP & Programming Fundamentals](#design-patterns-solid-oop--programming-fundamentals)
 
 ---
 
@@ -2331,6 +2332,298 @@ Store all sensitive values as GitHub Actions secrets, never in the repo. See the
 ## Deployment
 
 > All deployment steps live in the **[Production](#production)** section at the bottom of this document. Nothing here applies to local development.
+
+---
+
+## Design Patterns, SOLID, OOP & Programming Fundamentals
+
+> This section documents how Design Patterns, SOLID principles, OOP concepts, and programming
+> fundamentals are **already embedded** in the design decisions made in §1–17. No new endpoints,
+> services, or infrastructure components are introduced here.
+
+---
+
+### Pattern Distribution by Layer
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       HTTP Layer                                    │
+│  Form Request Validation · Null Object (uniform response shape)     │
+├─────────────────────────────────────────────────────────────────────┤
+│                      Business Layer                                 │
+│  Command (Actions) · Strategy (PaymentGateway) · Observer           │
+│  (Events/Listeners) · Template Method (checkout flow)              │
+│  Decorator (cart totals) · DTO (CheckoutData, CartItemData)         │
+├─────────────────────────────────────────────────────────────────────┤
+│                       Domain Layer                                  │
+│  State Machine (OrderStatus / PaymentStatus) · Repository           │
+│  (Eloquent Models) · Value Objects (Money, OrderNumber, SKU)        │
+│  Null Object (empty cart) · Factory · Custom Exceptions             │
+├─────────────────────────────────────────────────────────────────────┤
+│                   Infrastructure Layer                              │
+│  Cache-Aside (Redis cart) · Pessimistic Lock (stock checkout)       │
+│  Queue (async listeners) · Stripe Gateway (Strategy concrete)       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Design Patterns
+
+#### Pattern Master Table
+
+| Pattern | Implementation | Layer | OOP Principle |
+|---------|----------------|-------|---------------|
+| Command | `CreateOrderAction`, `AddToCartAction`, `ProcessPaymentAction` | Business | Encapsulation |
+| State Machine | `OrderStatus`, `PaymentStatus` enums + `Order::canTransitionTo()` | Domain | Encapsulation, Open/Closed |
+| Observer | `OrderPlaced` event + `SendOrderConfirmationListener` | Business | DIP, Open/Closed |
+| Repository | Eloquent models centralise query logic | Domain/Infrastructure | SRP |
+| Cache-Aside | Redis `cart:{user_id}` with write-invalidate | Infrastructure | SoC, SRP |
+| DTO | `CheckoutData`, `CartItemData` | Business | Encapsulation |
+| Strategy | `PaymentGatewayInterface` / `StripeGateway` | Business/Infrastructure | OCP, DIP |
+| Factory | `CreateOrderAction` + Eloquent factories for tests | Domain | SRP |
+| Null Object | Empty cart returns `items:[]` + zero totals, same shape | Domain | Polymorphism |
+| Value Object | `Money`, `OrderNumber`, `SKU` — immutable, self-validating | Domain | Encapsulation |
+| Template Method | 15-step checkout flow (fixed skeleton, discrete steps) | Business | Inheritance/extension |
+| Decorator | Cart total: `SubtotalCalculator` → `TaxDecorator` → (future discounts) | Business | OCP, Composition |
+| Pessimistic Lock | `lockForUpdate()` inside checkout transaction | Infrastructure | Concurrency safety |
+
+---
+
+#### Pattern Deep-Dives
+
+**1. Command (Actions)**
+
+- **Intent:** encapsulate a single business operation as an object so callers need no knowledge of its internals.
+- **Applied here:** `CreateOrderAction`, `AddToCartAction`, and `ProcessPaymentAction` each own exactly one use-case. Controllers instantiate the action and call `handle()`; they never touch Eloquent, Redis, or Stripe directly.
+- **OOP concept:** *Encapsulation* — state and behaviour of the operation are hidden behind a single public method. See §10 Checkout Flow.
+
+---
+
+**2. State Machine**
+
+- **Intent:** restrict an object to a defined set of states and legal transitions, rejecting all others.
+- **Applied here:** `OrderStatus` and `PaymentStatus` are PHP 8.1 backed enums. `Order::canTransitionTo(OrderStatus $next): bool` consults a per-case transition table and returns `false` for illegal moves, throwing `InvalidStatusTransitionException` on an attempted guard breach.
+- **OOP concept:** *Encapsulation* — no external caller can write `$order->status = 'refunded'` and bypass the guard. *Open/Closed* — adding a new status case requires only a new enum entry and transition-table row; `canTransitionTo()` is untouched. See §6 State Machines.
+
+---
+
+**3. Observer (Event / Listener)**
+
+- **Intent:** decouple the source of an event from any number of reactions to it.
+- **Applied here:** `CreateOrderAction` fires `OrderPlaced`; `SendOrderConfirmationListener` handles it asynchronously on the queue. Adding a second listener (e.g. `UpdateInventoryListener`) requires zero changes to the Action.
+- **OOP concept:** *Open/Closed* — the system is open for extension (new listeners) but closed for modification (Action unchanged). *DIP* — the Action depends on the event bus abstraction, not on any concrete listener. See §10 Checkout Flow, §11 Payment Flow.
+
+---
+
+**4. Strategy (Payment Gateway)**
+
+- **Intent:** define a family of interchangeable algorithms behind a common interface.
+- **Applied here:** `PaymentGatewayInterface` declares `createIntent()` and `verify()`. `StripeGateway` is the concrete strategy; it is injected into `ProcessPaymentAction` via the Laravel container. Swapping to `PayPalGateway` requires binding the new class in `AppServiceProvider` — zero Action changes.
+- **OOP concept:** *DIP* — the Action depends on the interface abstraction. *OCP* — new gateways are additions, not modifications. See §11 Payment Flow.
+
+---
+
+**5. Cache-Aside**
+
+- **Intent:** keep the cache in sync with the database by writing to the DB first, then invalidating the cache; reads fill the cache on a miss.
+- **Applied here:** `GET /cart` reads `cart:{user_id}` from Redis; on a miss it queries MySQL and writes back with a 1-hour TTL. Every cart mutation (`AddToCartAction`, `RemoveCartItemAction`, etc.) deletes the cache key so the next read rebuilds from the DB.
+- **OOP concept:** *Separation of Concerns* — the caching decision lives in the cart service layer, not in the Eloquent model. *SRP* — each Action has one job; the cache layer is a transparent wrapper. See §9 Cart Flow.
+
+---
+
+**6. Value Objects (`Money`, `OrderNumber`, `SKU`)**
+
+- **Intent:** represent a domain concept as an immutable, equality-by-value object that validates itself on construction.
+- **Applied here:** `Money` stores an integer amount in cents with a currency code; arithmetic methods (`add()`, `subtract()`) return new instances. `OrderNumber` enforces the `ORD-` prefix and uniqueness format. `SKU` validates the allowed character set. None of these classes have setters.
+- **OOP concept:** *Encapsulation* — invalid states are unrepresentable; callers cannot mutate the object after creation. Eliminates primitive obsession (raw `float` or `string` prices). See §3 Domain Model.
+
+---
+
+**7. Decorator (Cart Totals)**
+
+- **Intent:** wrap a core object with additional behaviour at runtime without modifying it.
+- **Applied here:** `SubtotalCalculator` sums `price × quantity` for all cart items. `TaxDecorator` wraps it, calls `calculate()` on the inner calculator, then adds the tax amount. A future `DiscountDecorator` would wrap `TaxDecorator` — the base class is never touched.
+- **OOP concept:** *OCP* — new pricing rules (shipping, coupons) are new decorator classes, not modifications to existing ones. *Composition over inheritance* — behaviour is assembled at runtime.
+
+---
+
+**8. Null Object (Empty Cart)**
+
+- **Intent:** provide a do-nothing object that honours the same interface as the real object, eliminating null checks in callers.
+- **Applied here:** `GET /cart` for a user with no items returns `{ "items": [], "subtotal": "0.00", "tax": "0.00", "total": "0.00", "items_count": 0 }` — the same JSON shape as a populated cart. No caller needs `if ($cart === null)`. Custom domain exceptions (`EmptyCartException`, `CartItemNotFoundException`) are thrown by Actions, not left as null returns. See §9 Cart Flow, §12 Error Handling.
+
+---
+
+### SOLID Principles
+
+#### S — Single Responsibility Principle
+
+Each class has exactly one reason to change:
+
+| Class | Sole responsibility |
+|-------|---------------------|
+| `CheckoutController` | Parse HTTP request; delegate to Action; format HTTP response |
+| `CreateOrderAction` | Orchestrate the 15-step checkout transaction |
+| `SendOrderConfirmationListener` | Send the order confirmation email |
+| `OrderStatus` | Define the valid set of order statuses and legal transitions |
+| `CartResource` | Format the cart payload for every cart endpoint |
+
+Violations to avoid: putting stock-validation logic in `CheckoutController`; sending email inside `CreateOrderAction` (email must not block the transaction).
+
+---
+
+#### O — Open/Closed Principle
+
+The system is open for extension, closed for modification:
+
+| Extension | How | What is NOT changed |
+|-----------|-----|---------------------|
+| Add `PayPalGateway` | Implement `PaymentGatewayInterface`; bind in container | `ProcessPaymentAction` |
+| Add `ON_HOLD` order status | New enum case + transition-table row | `canTransitionTo()` body |
+| Add second `OrderPlaced` listener | New listener class registered in `EventServiceProvider` | `CreateOrderAction` |
+| Add `DiscountDecorator` to cart totals | New class wrapping `TaxDecorator` | `SubtotalCalculator`, `TaxDecorator` |
+
+---
+
+#### L — Liskov Substitution Principle
+
+Any subtype must be substitutable for its supertype without breaking callers:
+
+- **`PaymentGatewayInterface`:** any concrete gateway must honour the declared return types; no silent nulls or coerced exceptions that callers do not expect.
+- **Null Object (empty cart):** responds with the identical JSON shape as a populated cart — callers never break.
+- **`OrderStatus` enum cases:** every case must implement `label()` and correctly populate its `canTransitionTo()` entry; a case that returns `true` for an illegal transition breaks the state-machine contract.
+- **Custom exceptions:** `EmptyCartException` and `CartItemNotFoundException` extend `DomainException`; the global handler catches `DomainException` and calls `render()` — any new domain exception must implement `render()` to preserve this contract. See §12 Error Handling.
+
+---
+
+#### I — Interface Segregation Principle
+
+Interfaces and request objects expose only what a client actually needs:
+
+- **`PaymentGatewayInterface`:** only `createIntent()` and `verify()` — no refund, subscription, or webhook methods unless a use-case demands them.
+- **Form Requests:** one per endpoint (`StoreCartItemRequest`, `CheckoutRequest`, etc.) — no monolithic `ApiRequest` that forces every endpoint to declare rules for fields it never receives.
+- **Eloquent scopes:** `scopeActive()` and `scopeInStock()` are added only to `Product`; other models do not inherit unneeded query logic.
+
+---
+
+#### D — Dependency Inversion Principle
+
+High-level modules depend on abstractions, not concretions:
+
+| High-level module | Depends on | Not on |
+|-------------------|-----------|--------|
+| `CreateOrderAction` | `PaymentGatewayInterface` | `StripeGateway` |
+| `CheckoutController` | `CreateOrderAction` | Eloquent models directly |
+| `SendOrderConfirmationListener` | `OrderPlaced` event data | The Action that fired it |
+| All Actions | Laravel container injection | `new StripeGateway()` |
+
+Constructor injection is the preferred wiring mechanism; all dependencies are visible in the constructor signature and trivially mockable in tests.
+
+---
+
+### Object-Oriented Programming Concepts
+
+#### Encapsulation
+
+Information hiding: expose only what callers need; protect internal state from external mutation.
+
+- `Order::transitionTo()` is the single gateway for status changes; `$order->status = 'refunded'` directly is blocked by the guard method.
+- `Money` has readonly properties; `add()` and `subtract()` return new `Money` instances rather than mutating `$this`.
+- `CheckoutData` DTO is built from a validated `CheckoutRequest` with readonly properties — no post-construction mutation.
+- Cart totals are cached behind `getCart()`; callers do not know whether the data came from Redis or MySQL.
+
+---
+
+#### Abstraction
+
+Hide complexity behind a simplified interface:
+
+- `PaymentGatewayInterface` hides Stripe's HTTP client, retry logic, and idempotency keys; the Action calls `createIntent($amount, $currency, $paymentMethod)`.
+- Actions hide the 15-step checkout transaction (lock, validate stock, snapshot prices, create order, deduct stock, create payment, fire event, clear cart) behind a single `handle(CheckoutData $data): Order`.
+- `getCart()` (or equivalent service method) hides whether the result came from Redis cache or a MySQL query.
+- Eloquent ORM abstracts raw SQL from Actions; Actions never concatenate query strings.
+
+---
+
+#### Polymorphism
+
+One interface, many implementations — callers are decoupled from the concrete type:
+
+- `$gateway->createIntent()` executes identically from the Action's perspective whether `$gateway` is a `StripeGateway` or a future `PayPalGateway`.
+- `OrderStatus::Pending->label()` and `OrderStatus::Processing->label()` share the same call site; each enum case returns its own string.
+- The empty-cart Null Object responds to the same interface as a populated cart — `GET /cart` code path is identical regardless of cart contents.
+- Domain exceptions expose a `render(): JsonResponse` method; the global handler calls it polymorphically with no `switch`/`instanceof` chain. See §12 Error Handling.
+
+---
+
+#### Inheritance
+
+Used deliberately and sparingly; prefer composition for shared behaviour:
+
+- **Exception hierarchy:** `EmptyCartException extends DomainException extends RuntimeException` — a single `catch (DomainException $e)` in the global handler covers all domain errors without an explicit list of types.
+- **Framework extension:** `Controller`, `FormRequest`, `Model`, and `TestCase` are genuine *is-a* relationships with the framework base classes; Laravel's contracts are honoured.
+- **Actions do NOT share a base Action class** — there is no shared mutable state between actions, so inheritance would add coupling with no benefit. Composition (injecting shared services) is used instead.
+
+---
+
+### Programming Fundamentals
+
+#### DRY — Don't Repeat Yourself
+
+Every piece of knowledge has a single, authoritative location:
+
+| Knowledge | Single location |
+|-----------|----------------|
+| Tax rate | `TAX_RATE` constant consumed only by `TaxDecorator` |
+| Order number format | `OrderNumber` value object |
+| Stock validation logic | Inside `CreateOrderAction` only (not in `AddToCartAction`, not in middleware) |
+| Cart JSON shape | `CartResource` — used by all five cart endpoints |
+| Authentication guard | `auth:sanctum` middleware applied once at the route group level |
+
+---
+
+#### KISS — Keep It Simple
+
+Deliberate simplicity choices that eliminated unnecessary complexity:
+
+- **Checkout reads from the cart**, not from a `items[]` array in the request body — one source of truth, no reconciliation needed.
+- **1:1 User→Cart** is enforced by a DB `UNIQUE` constraint — no application-level guard or "find or create" complexity.
+- **Stock is checked only at checkout** — no reservation system, no two-phase commit, no expiry jobs. Simpler flow with the trade-off that a low-stock item can be in many carts simultaneously.
+- **PHP 8.1 backed enums** replace what would otherwise be a separate State class hierarchy with a registry.
+
+---
+
+#### YAGNI — You Aren't Gonna Need It
+
+Features deliberately excluded because no current use-case requires them:
+
+- Product categories / tags
+- Multi-currency conversion
+- Admin panel or back-office API
+- Cart versioning or saved/named carts
+- Subscription or recurring payment interface
+- Full-text product search (Elasticsearch / Meilisearch)
+- Discount / coupon codes (the `DiscountDecorator` slot exists in the design but is not wired)
+- Audit log / change history on orders
+
+---
+
+#### Separation of Concerns
+
+Each layer owns a distinct responsibility and does not reach into another layer's domain:
+
+| Layer | Owns | Does NOT do |
+|-------|------|-------------|
+| HTTP (Controllers, Form Requests) | Parse, validate, respond | SQL queries, Redis commands, business decisions |
+| Business (Actions, Events, Listeners) | Use-cases, workflows | HTTP status codes, raw cache commands |
+| Domain (Models, Enums, Value Objects, Exceptions) | Business rules, entity behaviour | HTTP knowledge, queue dispatch |
+| Infrastructure (Cache, Queue, Stripe, DB) | Persistence, messaging, external APIs | Business decisions, response formatting |
+
+Concrete examples:
+- Caching lives in the cart service layer, not inside the `Cart` Eloquent model.
+- Input validation lives in `FormRequest` classes, not inside Actions.
+- Email dispatch lives in `SendOrderConfirmationListener`, not in `CreateOrderAction` — email must not block the checkout database transaction.
 
 ---
 
