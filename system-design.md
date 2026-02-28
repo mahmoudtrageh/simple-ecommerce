@@ -1,0 +1,2692 @@
+# System Design: Laravel E-Commerce
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Domain Model](#domain-model)
+4. [Entity Relationship Diagram](#entity-relationship-diagram)
+5. [Database Schema](#database-schema)
+6. [State Machines](#state-machines)
+7. [API Design](#api-design)
+8. [Authentication Flow](#authentication-flow)
+9. [Cart Flow](#cart-flow)
+10. [Checkout Flow](#checkout-flow)
+11. [Payment Flow](#payment-flow)
+12. [Error Handling](#error-handling)
+13. [Security Considerations](#security-considerations)
+14. [Docker Configuration](#docker-configuration)
+15. [Testing](#testing)
+16. [CI/CD](#cicd)
+17. [Deployment](#deployment)
+
+---
+
+**Production (server-only)**
+
+- [Production Architecture](#production-architecture)
+- [Production — Docker](#production--docker)
+- [Production — CI/CD](#production--cicd)
+- [Production — Deployment Steps](#production--deployment-steps)
+
+---
+
+## Overview
+
+### Project Scope
+
+A simple e-commerce API with:
+- User authentication (register, login, logout)
+- Product catalog
+- Shopping cart (persistent, per-user)
+- Shopping checkout
+- Order management
+- Payment processing (Stripe)
+
+### Tech Stack
+
+| Layer | Technology |
+|-------|------------|
+| Framework | Laravel 11 |
+| PHP Version | 8.3 |
+| Database | MySQL 8.0 |
+| Cache | Redis |
+| Queue | Redis |
+| Auth | Laravel Sanctum |
+| Payment | Stripe |
+| Containerization | Docker |
+
+---
+
+## Architecture
+
+### High-Level Architecture (Local)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CLIENT                                   │
+│                  (Postman / curl / Web)                         │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │ HTTP  (localhost:8000)
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      NGINX (port 8000)                           │
+│                     - Reverse proxy only                        │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    LARAVEL APPLICATION                           │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │ Controllers │──│   Actions   │──│  Services   │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+│         │                │                │                      │
+│         ▼                ▼                ▼                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  Requests   │  │   Models    │  │   Events    │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+└─────────┬───────────────┬───────────────┬───────────────────────┘
+          │               │               │
+          ▼               ▼               ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│    MySQL     │  │    Redis     │  │    Stripe    │
+│  (Database)  │  │(Cache/Queue) │  │  (Test Keys) │
+└──────────────┘  └──────────────┘  └──────────────┘
+```
+
+### Application Layers
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                      HTTP Layer                             │
+│   Routes → Middleware → Controllers → Requests → Resources │
+└────────────────────────────┬───────────────────────────────┘
+                             │
+┌────────────────────────────▼───────────────────────────────┐
+│                    Business Layer                           │
+│              Actions → DTOs → Events → Listeners           │
+└────────────────────────────┬───────────────────────────────┘
+                             │
+┌────────────────────────────▼───────────────────────────────┐
+│                     Domain Layer                            │
+│               Models → Enums → Exceptions                   │
+└────────────────────────────┬───────────────────────────────┘
+                             │
+┌────────────────────────────▼───────────────────────────────┐
+│                  Infrastructure Layer                       │
+│          Database → Cache → Queue → External APIs          │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Domain Model
+
+### Entities
+
+| Entity | Description |
+|--------|-------------|
+| **User** | Registered customer who can place orders |
+| **Product** | Item available for purchase |
+| **Cart** | Persistent shopping cart belonging to a user |
+| **CartItem** | A product line item within a cart |
+| **Order** | A customer's purchase request |
+| **OrderItem** | Line item within an order |
+| **Payment** | Payment transaction for an order |
+
+### Relationships
+
+```
+User
+ │
+ ├──○ Cart (1:1 - User has one active Cart)
+ │     │
+ │     └──< CartItem (1:N - Cart has many CartItems)
+ │           │
+ │           └──> Product (N:1 - CartItem belongs to Product)
+ │
+ └──< Order (1:N - User has many Orders)
+       │
+       ├──< OrderItem (1:N - Order has many OrderItems)
+       │     │
+       │     └──> Product (N:1 - OrderItem belongs to Product)
+       │
+       └──○ Payment (1:1 - Order has one Payment)
+```
+
+### Relationship Summary
+
+| Parent | Child | Type | Description |
+|--------|-------|------|-------------|
+| User | Cart | 1:1 | A user has one active cart |
+| Cart | CartItem | 1:N | A cart contains multiple items |
+| Product | CartItem | 1:N | A product can appear in many carts |
+| User | Order | 1:N | A user can have multiple orders |
+| Order | OrderItem | 1:N | An order contains multiple items |
+| Order | Payment | 1:1 | An order has one payment record |
+| Product | OrderItem | 1:N | A product can be in multiple order items |
+
+---
+
+## Entity Relationship Diagram
+
+```
+┌─────────────────────┐       ┌─────────────────────────────┐
+│       USERS         │       │          PRODUCTS           │
+├─────────────────────┤       ├─────────────────────────────┤
+│ PK  id              │       │ PK  id                      │
+│     name            │       │     name                    │
+│     email (unique)  │       │     slug (unique)           │
+│     password        │       │     description             │
+│     created_at      │       │     price (decimal 10,2)    │
+│     updated_at      │       │     stock (unsigned int)    │
+└──────┬──────────────┘       │     sku (unique)            │
+       │                      │     is_active (boolean)     │
+       │ 1:1                  │     created_at              │
+       │                      │     updated_at              │
+       ▼                      └────────┬────────────────────┘
+┌─────────────────────────────┐        │
+│           CARTS             │        │
+├─────────────────────────────┤        │
+│ PK  id                      │        │
+│ FK  user_id (unique)        │        │
+│     created_at              │        │
+│     updated_at              │        │
+└─────────┬───────────────────┘        │
+          │                            │
+          │ 1:N                        │ 1:N
+          │                            │
+          ▼                            │
+┌─────────────────────────────┐        │
+│         CART_ITEMS          │◄───────┘
+├─────────────────────────────┤
+│ PK  id                      │
+│ FK  cart_id                 │
+│ FK  product_id              │
+│     quantity                │
+│     created_at              │
+│     updated_at              │
+└─────────────────────────────┘
+
+┌─────────────────────┐
+│       USERS         │
+└─────────┬───────────┘
+          │
+          │ 1:N
+          │
+          ▼
+┌─────────────────────────────┐       ┌─────────────────────────────┐
+│          ORDERS             │       │          PRODUCTS           │
+├─────────────────────────────┤       └──────────────┬──────────────┘
+│ PK  id                      │                      │
+│ FK  user_id                 │                      │
+│     order_number (unique)   │                      │
+│     status (enum)           │                      │
+│     payment_status (enum)   │                      │
+│     subtotal (decimal 10,2) │                      │
+│     tax (decimal 10,2)      │                      │
+│     total (decimal 10,2)    │                      │
+│     notes                   │                      │
+│     created_at              │                      │
+│     updated_at              │                      │
+└─────────┬───────────────────┘                      │
+          │                                           │
+          │ 1:N                                       │ 1:N
+          │                                           │
+          ▼                                           │
+┌─────────────────────────────┐                      │
+│       ORDER_ITEMS           │◄─────────────────────┘
+├─────────────────────────────┤
+│ PK  id                      │
+│ FK  order_id                │
+│ FK  product_id              │
+│     product_name (snapshot) │
+│     price (snapshot)        │
+│     quantity                │
+│     total                   │
+│     created_at              │
+│     updated_at              │
+└─────────────────────────────┘
+
+┌─────────────────────────────┐
+│         PAYMENTS            │
+├─────────────────────────────┤
+│ PK  id                      │
+│ FK  order_id                │
+│     method (string)         │
+│     transaction_id          │
+│     amount (decimal 10,2)   │
+│     currency (char 3)       │
+│     status (enum)           │
+│     metadata (json)         │
+│     paid_at (timestamp)     │
+│     created_at              │
+│     updated_at              │
+└─────────────────────────────┘
+```
+
+---
+
+## Database Schema
+
+### users
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| name | VARCHAR(255) | NOT NULL |
+| email | VARCHAR(255) | NOT NULL, UNIQUE |
+| email_verified_at | TIMESTAMP | NULLABLE |
+| password | VARCHAR(255) | NOT NULL |
+| remember_token | VARCHAR(100) | NULLABLE |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+
+### products
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| name | VARCHAR(255) | NOT NULL |
+| slug | VARCHAR(255) | NOT NULL, UNIQUE |
+| description | TEXT | NULLABLE |
+| price | DECIMAL(10,2) | NOT NULL |
+| stock | INT UNSIGNED | NOT NULL, DEFAULT 0 |
+| sku | VARCHAR(255) | NOT NULL, UNIQUE |
+| is_active | BOOLEAN | NOT NULL, DEFAULT TRUE |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+| deleted_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_products_active_stock` (is_active, stock)
+- `idx_products_price` (price)
+
+### carts
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| user_id | BIGINT UNSIGNED | FK → users.id, ON DELETE CASCADE, UNIQUE |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_carts_user` (user_id) — enforced by UNIQUE constraint
+
+### cart_items
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| cart_id | BIGINT UNSIGNED | FK → carts.id, ON DELETE CASCADE |
+| product_id | BIGINT UNSIGNED | FK → products.id, ON DELETE CASCADE |
+| quantity | INT UNSIGNED | NOT NULL, DEFAULT 1 |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_cart_items_cart_product` (cart_id, product_id) — UNIQUE, prevents duplicate product rows per cart
+
+---
+
+### orders
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| user_id | BIGINT UNSIGNED | FK → users.id, ON DELETE CASCADE |
+| order_number | VARCHAR(255) | NOT NULL, UNIQUE |
+| status | VARCHAR(50) | NOT NULL, DEFAULT 'pending' |
+| payment_status | VARCHAR(50) | NOT NULL, DEFAULT 'pending' |
+| subtotal | DECIMAL(10,2) | NOT NULL |
+| tax | DECIMAL(10,2) | NOT NULL, DEFAULT 0 |
+| total | DECIMAL(10,2) | NOT NULL |
+| notes | TEXT | NULLABLE |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+| deleted_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_orders_user_status` (user_id, status)
+- `idx_orders_created` (created_at)
+
+### order_items
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| order_id | BIGINT UNSIGNED | FK → orders.id, ON DELETE CASCADE |
+| product_id | BIGINT UNSIGNED | FK → products.id |
+| product_name | VARCHAR(255) | NOT NULL |
+| price | DECIMAL(10,2) | NOT NULL |
+| quantity | INT UNSIGNED | NOT NULL |
+| total | DECIMAL(10,2) | NOT NULL |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_order_items_order_product` (order_id, product_id)
+
+### payments
+
+| Column | Type | Constraints |
+|--------|------|-------------|
+| id | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
+| order_id | BIGINT UNSIGNED | FK → orders.id, ON DELETE CASCADE |
+| method | VARCHAR(50) | NOT NULL |
+| transaction_id | VARCHAR(255) | NULLABLE |
+| amount | DECIMAL(10,2) | NOT NULL |
+| currency | CHAR(3) | NOT NULL, DEFAULT 'USD' |
+| status | VARCHAR(50) | NOT NULL, DEFAULT 'pending' |
+| metadata | JSON | NULLABLE |
+| paid_at | TIMESTAMP | NULLABLE |
+| created_at | TIMESTAMP | NULLABLE |
+| updated_at | TIMESTAMP | NULLABLE |
+
+**Indexes:**
+- `idx_payments_transaction` (transaction_id)
+- `idx_payments_order_status` (order_id, status)
+
+---
+
+## State Machines
+
+### Order Status
+
+```
+                    ┌─────────────┐
+                    │   PENDING   │
+                    └──────┬──────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+      ┌──────────────┐          ┌──────────────┐
+      │  PROCESSING  │          │  CANCELLED   │
+      └──────┬───────┘          └──────────────┘
+             │
+    ┌────────┼────────┐
+    │        │        │
+    ▼        ▼        ▼
+┌────────┐ ┌────────┐ ┌────────┐
+│COMPLETED│ │CANCELLED│ │REFUNDED│
+└────────┘ └────────┘ └────────┘
+```
+
+#### Transition Rules
+
+| From | To | Condition |
+|------|-----|-----------|
+| pending | processing | Payment successful |
+| pending | cancelled | User cancels or payment fails |
+| processing | completed | Order fulfilled |
+| processing | cancelled | Admin cancels |
+| processing | refunded | Refund processed |
+| completed | refunded | Refund processed |
+
+### Payment Status
+
+```
+       ┌─────────────┐
+       │   PENDING   │
+       └──────┬──────┘
+              │
+     ┌────────┴────────┐
+     │                 │
+     ▼                 ▼
+┌─────────┐      ┌─────────┐
+│  PAID   │      │ FAILED  │
+└────┬────┘      └─────────┘
+     │
+     ▼
+┌─────────┐
+│REFUNDED │
+└─────────┘
+```
+
+#### Transition Rules
+
+| From | To | Condition |
+|------|-----|-----------|
+| pending | paid | Payment gateway confirms |
+| pending | failed | Payment gateway rejects |
+| paid | refunded | Refund processed |
+
+---
+
+## API Design
+
+### Base URL
+
+```
+https://api.example.com/api/v1
+```
+
+### Headers
+
+| Header | Value | Required |
+|--------|-------|----------|
+| Content-Type | application/json | Yes |
+| Accept | application/json | Yes |
+| Authorization | Bearer {token} | For protected routes |
+
+### Response Format
+
+#### Success Response
+
+```json
+{
+  "success": true,
+  "message": "Operation successful",
+  "data": { ... }
+}
+```
+
+#### Success with Pagination
+
+```json
+{
+  "success": true,
+  "data": [ ... ],
+  "meta": {
+    "current_page": 1,
+    "per_page": 15,
+    "total": 100,
+    "last_page": 7
+  },
+  "links": {
+    "first": "...",
+    "last": "...",
+    "prev": null,
+    "next": "..."
+  }
+}
+```
+
+#### Error Response
+
+```json
+{
+  "success": false,
+  "message": "Error description",
+  "errors": {
+    "field": ["Error message"]
+  }
+}
+```
+
+### Endpoints
+
+#### Authentication
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | /register | Register new user | No |
+| POST | /login | Login user | No |
+| POST | /logout | Logout user | Yes |
+| POST | /password/forgot | Request reset email | No |
+| POST | /password/reset | Reset password | No |
+
+#### Products
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| GET | /products | List all products | No |
+| GET | /products/{slug} | Get product details | No |
+
+#### Cart
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| GET | /cart | Get current user's cart | Yes |
+| POST | /cart/items | Add item to cart | Yes |
+| PUT | /cart/items/{productId} | Update item quantity | Yes |
+| DELETE | /cart/items/{productId} | Remove item from cart | Yes |
+| DELETE | /cart | Clear entire cart | Yes |
+
+#### Checkout & Orders
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | /checkout | Process checkout (from cart) | Yes |
+| GET | /orders | List user orders | Yes |
+| GET | /orders/{id} | Get order details | Yes |
+| POST | /orders/{id}/cancel | Cancel order | Yes |
+
+#### Payments
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | /orders/{id}/pay | Process payment | Yes |
+| GET | /payment-methods | List payment methods | Yes |
+
+#### Webhooks
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | /webhooks/stripe | Stripe webhook | Signature |
+
+---
+
+### Endpoint Details
+
+#### POST /register
+
+**Request:**
+```json
+{
+  "name": "John Doe",
+  "email": "john@example.com",
+  "password": "password123",
+  "password_confirmation": "password123"
+}
+```
+
+**Response (201):**
+```json
+{
+  "success": true,
+  "message": "Registration successful",
+  "data": {
+    "user": {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@example.com",
+      "created_at": "2024-01-15T10:30:00Z"
+    },
+    "token": "1|abc123..."
+  }
+}
+```
+
+**Validation Rules:**
+- name: required, string, max:255
+- email: required, email, unique:users
+- password: required, min:8, confirmed
+
+---
+
+#### POST /login
+
+**Request:**
+```json
+{
+  "email": "john@example.com",
+  "password": "password123"
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Login successful",
+  "data": {
+    "user": {
+      "id": 1,
+      "name": "John Doe",
+      "email": "john@example.com"
+    },
+    "token": "2|xyz789..."
+  }
+}
+```
+
+**Error (401):**
+```json
+{
+  "success": false,
+  "message": "Invalid credentials"
+}
+```
+
+---
+
+#### POST /checkout
+
+**Request:**
+```json
+{
+  "items": [
+    {
+      "product_id": 1,
+      "quantity": 2
+    },
+    {
+      "product_id": 3,
+      "quantity": 1
+    }
+  ],
+  "payment_method": "stripe",
+  "notes": "Please gift wrap"
+}
+```
+
+**Response (201):**
+```json
+{
+  "success": true,
+  "message": "Order placed successfully",
+  "data": {
+    "id": 1,
+    "order_number": "ORD-ABC123",
+    "status": {
+      "value": "pending",
+      "label": "Pending"
+    },
+    "payment_status": {
+      "value": "pending",
+      "label": "Pending"
+    },
+    "subtotal": "150.00",
+    "tax": "15.00",
+    "total": "165.00",
+    "items": [
+      {
+        "id": 1,
+        "product_id": 1,
+        "product_name": "Product A",
+        "price": "50.00",
+        "quantity": 2,
+        "total": "100.00"
+      },
+      {
+        "id": 2,
+        "product_id": 3,
+        "product_name": "Product C",
+        "price": "50.00",
+        "quantity": 1,
+        "total": "50.00"
+      }
+    ],
+    "payment": {
+      "id": 1,
+      "method": "stripe",
+      "status": "pending",
+      "client_secret": "pi_xxx_secret_xxx"
+    },
+    "created_at": "2024-01-15T10:30:00Z"
+  }
+}
+```
+
+**Validation Rules:**
+- items: required, array, min:1
+- items.*.product_id: required, exists:products,id
+- items.*.quantity: required, integer, min:1, max:100
+- payment_method: required, in:stripe,paypal,cod
+- notes: nullable, string, max:500
+
+**Error - Insufficient Stock (422):**
+```json
+{
+  "success": false,
+  "message": "Insufficient stock for Product A. Available: 1, Requested: 2"
+}
+```
+
+---
+
+#### GET /orders
+
+**Query Parameters:**
+- page: integer (default: 1)
+- per_page: integer (default: 15, max: 50)
+- status: string (filter by status)
+- sort: string (default: -created_at)
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": 1,
+      "order_number": "ORD-ABC123",
+      "status": {
+        "value": "completed",
+        "label": "Completed"
+      },
+      "total": "165.00",
+      "items_count": 2,
+      "created_at": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "meta": {
+    "current_page": 1,
+    "per_page": 15,
+    "total": 25
+  }
+}
+```
+
+---
+
+#### GET /orders/{id}
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "order_number": "ORD-ABC123",
+    "status": {
+      "value": "completed",
+      "label": "Completed"
+    },
+    "payment_status": {
+      "value": "paid",
+      "label": "Paid"
+    },
+    "subtotal": "150.00",
+    "tax": "15.00",
+    "total": "165.00",
+    "notes": "Please gift wrap",
+    "can_cancel": false,
+    "can_refund": true,
+    "items": [
+      {
+        "id": 1,
+        "product_id": 1,
+        "product_name": "Product A",
+        "price": "50.00",
+        "quantity": 2,
+        "total": "100.00",
+        "product": {
+          "id": 1,
+          "name": "Product A",
+          "slug": "product-a"
+        }
+      }
+    ],
+    "payment": {
+      "id": 1,
+      "method": "stripe",
+      "transaction_id": "pi_xxx",
+      "amount": "165.00",
+      "status": "paid",
+      "paid_at": "2024-01-15T10:31:00Z"
+    },
+    "created_at": "2024-01-15T10:30:00Z",
+    "updated_at": "2024-01-15T10:31:00Z"
+  }
+}
+```
+
+**Error - Not Found (404):**
+```json
+{
+  "success": false,
+  "message": "Order not found"
+}
+```
+
+**Error - Forbidden (403):**
+```json
+{
+  "success": false,
+  "message": "You do not have permission to view this order"
+}
+```
+
+---
+
+#### POST /orders/{id}/cancel
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Order cancelled successfully",
+  "data": {
+    "id": 1,
+    "order_number": "ORD-ABC123",
+    "status": {
+      "value": "cancelled",
+      "label": "Cancelled"
+    }
+  }
+}
+```
+
+**Error - Cannot Cancel (422):**
+```json
+{
+  "success": false,
+  "message": "This order cannot be cancelled"
+}
+```
+
+---
+
+#### GET /cart
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": 1,
+    "items": [
+      {
+        "id": 1,
+        "product_id": 3,
+        "product_name": "Product C",
+        "slug": "product-c",
+        "price": "50.00",
+        "quantity": 2,
+        "subtotal": "100.00",
+        "in_stock": true
+      }
+    ],
+    "subtotal": "100.00",
+    "tax": "10.00",
+    "total": "110.00",
+    "items_count": 2,
+    "updated_at": "2024-01-15T10:00:00Z"
+  }
+}
+```
+
+> An empty cart returns `"items": []` with all totals as `"0.00"`.
+
+---
+
+#### POST /cart/items
+
+**Request:**
+```json
+{
+  "product_id": 3,
+  "quantity": 2
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Item added to cart",
+  "data": { /* full cart object, same shape as GET /cart */ }
+}
+```
+
+**Validation Rules:**
+- product_id: required, exists:products,id, active product
+- quantity: required, integer, min:1, max:100
+
+**Error - Product inactive or not found (422):**
+```json
+{
+  "success": false,
+  "message": "Product is not available"
+}
+```
+
+> If the product already exists in the cart, the quantities are **merged** (existing + new).
+
+---
+
+#### PUT /cart/items/{productId}
+
+**Request:**
+```json
+{
+  "quantity": 5
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Cart updated",
+  "data": { /* full cart object */ }
+}
+```
+
+**Validation Rules:**
+- quantity: required, integer, min:1, max:100
+
+**Error - Item not in cart (404):**
+```json
+{
+  "success": false,
+  "message": "Item not found in cart"
+}
+```
+
+---
+
+#### DELETE /cart/items/{productId}
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Item removed from cart",
+  "data": { /* full cart object */ }
+}
+```
+
+---
+
+#### DELETE /cart
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "message": "Cart cleared"
+}
+```
+
+---
+
+#### POST /checkout (updated — cart-based)
+
+The checkout endpoint now reads items directly from the user's active cart instead of accepting an `items` array in the request body.
+
+**Request:**
+```json
+{
+  "payment_method": "stripe",
+  "notes": "Please gift wrap"
+}
+```
+
+**Validation Rules:**
+- payment_method: required, in:stripe,paypal,cod
+- notes: nullable, string, max:500
+- Cart must be non-empty (422 if cart has no items)
+
+The response shape is unchanged (see original `/checkout` spec above). After a successful checkout the cart is **automatically cleared**.
+
+---
+
+## Authentication Flow
+
+```
+┌──────────┐          ┌──────────┐          ┌──────────┐
+│  Client  │          │   API    │          │ Database │
+└────┬─────┘          └────┬─────┘          └────┬─────┘
+     │                     │                     │
+     │  POST /register     │                     │
+     │────────────────────>│                     │
+     │                     │  Create User        │
+     │                     │────────────────────>│
+     │                     │                     │
+     │                     │  Generate Token     │
+     │                     │────────────────────>│
+     │                     │                     │
+     │  Return token       │                     │
+     │<────────────────────│                     │
+     │                     │                     │
+     │  POST /login        │                     │
+     │────────────────────>│                     │
+     │                     │  Verify credentials │
+     │                     │────────────────────>│
+     │                     │                     │
+     │                     │  Generate Token     │
+     │                     │────────────────────>│
+     │                     │                     │
+     │  Return token       │                     │
+     │<────────────────────│                     │
+     │                     │                     │
+     │  GET /orders        │                     │
+     │  (with Bearer token)│                     │
+     │────────────────────>│                     │
+     │                     │  Validate token     │
+     │                     │────────────────────>│
+     │                     │                     │
+     │                     │  Get user orders    │
+     │                     │────────────────────>│
+     │                     │                     │
+     │  Return orders      │                     │
+     │<────────────────────│                     │
+     │                     │                     │
+```
+
+---
+
+## Cart Flow
+
+```
+┌──────────┐          ┌──────────┐          ┌──────────┐          ┌──────────┐
+│  Client  │          │   API    │          │ Database │          │  Cache   │
+└────┬─────┘          └────┬─────┘          └────┬─────┘          └────┬─────┘
+     │                     │                     │                     │
+     │  POST /cart/items   │                     │                     │
+     │────────────────────>│                     │                     │
+     │                     │ Find or create cart │                     │
+     │                     │────────────────────>│                     │
+     │                     │                     │                     │
+     │                     │ Upsert cart_item    │                     │
+     │                     │────────────────────>│                     │
+     │                     │                     │                     │
+     │                     │ Invalidate cart cache                     │
+     │                     │────────────────────────────────────────> │
+     │                     │                     │                     │
+     │  Return full cart   │                     │                     │
+     │<────────────────────│                     │                     │
+     │                     │                     │                     │
+     │  GET /cart          │                     │                     │
+     │────────────────────>│                     │                     │
+     │                     │ Check cart cache    │                     │
+     │                     │────────────────────────────────────────> │
+     │                     │ (cache miss)        │                     │
+     │                     │ Load cart + items   │                     │
+     │                     │────────────────────>│                     │
+     │                     │ Compute totals      │                     │
+     │                     │ Cache result        │                     │
+     │                     │────────────────────────────────────────> │
+     │  Return cart        │                     │                     │
+     │<────────────────────│                     │                     │
+     │                     │                     │                     │
+     │  POST /checkout     │                     │                     │
+     │────────────────────>│                     │                     │
+     │                     │ Load cart items     │                     │
+     │                     │────────────────────>│                     │
+     │                     │ [... checkout flow proceeds ...]          │
+     │                     │ Clear cart          │                     │
+     │                     │────────────────────>│                     │
+     │                     │ Invalidate cart cache                     │
+     │                     │────────────────────────────────────────> │
+     │  Return order       │                     │                     │
+     │<────────────────────│                     │                     │
+     │                     │                     │                     │
+```
+
+### Cart Rules
+
+| Rule | Detail |
+|------|--------|
+| One cart per user | `carts.user_id` is UNIQUE; cart is created lazily on first add |
+| Duplicate products | Adding an existing product merges quantities rather than creating a new row |
+| Price displayed | Always real-time from `products.price`; cart does **not** snapshot prices |
+| Stock check | Stock is validated at **checkout time**, not when adding to cart |
+| Cart cleared | Automatically cleared after a successful checkout |
+| Inactive products | Items whose product becomes inactive are still stored but flagged `"in_stock": false` in the response |
+
+### Cart Caching Strategy
+
+Cart totals are computed from live product prices and cached in Redis per user.
+
+| Event | Cache Action |
+|-------|-------------|
+| Add / update / remove item | Invalidate `cart:{user_id}` |
+| Clear cart | Invalidate `cart:{user_id}` |
+| GET /cart (cache miss) | Rebuild and store with 1-hour TTL |
+
+---
+
+## Checkout Flow
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Client  │     │   API    │     │ Database │     │  Stripe  │     │  Queue   │
+└────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                │                │                │                │
+     │ POST /checkout │                │                │                │
+     │───────────────>│                │                │                │
+     │                │                │                │                │
+     │                │ BEGIN TRANSACTION               │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Lock products  │                │                │
+     │                │ (FOR UPDATE)   │                │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Validate stock │                │                │
+     │                │<───────────────│                │                │
+     │                │                │                │                │
+     │                │ Create order   │                │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Create items   │                │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Reduce stock   │                │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Create payment │                │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Create PaymentIntent            │                │
+     │                │────────────────────────────────>│                │
+     │                │                │                │                │
+     │                │ Return client_secret            │                │
+     │                │<────────────────────────────────│                │
+     │                │                │                │                │
+     │                │ COMMIT TRANSACTION              │                │
+     │                │───────────────>│                │                │
+     │                │                │                │                │
+     │                │ Dispatch OrderPlaced event      │                │
+     │                │─────────────────────────────────────────────────>│
+     │                │                │                │                │
+     │ Return order   │                │                │                │
+     │ + client_secret│                │                │                │
+     │<───────────────│                │                │                │
+     │                │                │                │                │
+```
+
+### Checkout Steps
+
+1. **Receive Request** - Validate payment method; ensure cart is non-empty
+2. **Load Cart** - Fetch authenticated user's cart with all items
+3. **Begin Transaction** - Start database transaction
+4. **Lock Products** - Use pessimistic locking (SELECT FOR UPDATE)
+5. **Validate Stock** - Check all cart items have sufficient stock
+6. **Calculate Totals** - Sum subtotal from live product prices, calculate tax
+7. **Create Order** - Insert order record
+8. **Create Order Items** - Insert line items with price snapshot
+9. **Reduce Stock** - Decrement product stock
+10. **Create Payment Intent** - Call Stripe API
+11. **Create Payment Record** - Store payment details
+12. **Clear Cart** - Delete all cart items and invalidate cache
+13. **Commit Transaction** - Finalize database changes
+14. **Dispatch Event** - Queue order confirmation email
+15. **Return Response** - Send order details + payment client_secret
+
+### Rollback Scenarios
+
+| Scenario | Action |
+|----------|--------|
+| Insufficient stock | Rollback, return 422 |
+| Payment intent fails | Rollback, return 402 |
+| Database error | Rollback, return 500 |
+
+---
+
+## Payment Flow
+
+### Stripe Payment Flow
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Client  │     │   API    │     │  Stripe  │     │ Database │
+└────┬─────┘     └────┬─────┘     └────┬─────┘     └────┬─────┘
+     │                │                │                │
+     │ Checkout       │                │                │
+     │───────────────>│                │                │
+     │                │ Create Intent  │                │
+     │                │───────────────>│                │
+     │                │                │                │
+     │ client_secret  │                │                │
+     │<───────────────│                │                │
+     │                │                │                │
+     │ Confirm payment│                │                │
+     │ (Stripe.js)    │                │                │
+     │────────────────────────────────>│                │
+     │                │                │                │
+     │ Payment result │                │                │
+     │<────────────────────────────────│                │
+     │                │                │                │
+     │                │   Webhook      │                │
+     │                │<───────────────│                │
+     │                │                │                │
+     │                │ Verify signature                │
+     │                │ Update payment │                │
+     │                │───────────────────────────────>│
+     │                │                │                │
+     │                │ Update order   │                │
+     │                │───────────────────────────────>│
+     │                │                │                │
+```
+
+### Webhook Events to Handle
+
+| Event | Action |
+|-------|--------|
+| payment_intent.succeeded | Mark payment as paid, order as processing |
+| payment_intent.payment_failed | Mark payment as failed, order as cancelled |
+| charge.refunded | Mark payment as refunded, order as refunded |
+
+---
+
+## Error Handling
+
+### HTTP Status Codes
+
+| Code | Meaning | Usage |
+|------|---------|-------|
+| 200 | OK | Successful GET, PUT, DELETE |
+| 201 | Created | Successful POST |
+| 400 | Bad Request | Malformed request |
+| 401 | Unauthorized | Missing or invalid token |
+| 403 | Forbidden | Insufficient permissions |
+| 404 | Not Found | Resource doesn't exist |
+| 422 | Unprocessable Entity | Validation failed |
+| 429 | Too Many Requests | Rate limit exceeded |
+| 500 | Internal Server Error | Server error |
+| 503 | Service Unavailable | Maintenance mode |
+
+### Custom Exceptions
+
+| Exception | Status | Description |
+|-----------|--------|-------------|
+| InsufficientStockException | 422 | Not enough stock for order |
+| PaymentFailedException | 402 | Payment processing failed |
+| InvalidOrderStateException | 422 | Invalid state transition |
+| OrderNotFoundException | 404 | Order doesn't exist |
+| EmptyCartException | 422 | Checkout attempted with empty cart |
+| CartItemNotFoundException | 404 | Product not found in cart |
+
+### Error Response Examples
+
+**Validation Error (422):**
+```json
+{
+  "success": false,
+  "message": "Validation failed",
+  "errors": {
+    "email": ["The email field is required."],
+    "password": ["The password must be at least 8 characters."]
+  }
+}
+```
+
+**Authentication Error (401):**
+```json
+{
+  "success": false,
+  "message": "Unauthenticated"
+}
+```
+
+**Authorization Error (403):**
+```json
+{
+  "success": false,
+  "message": "You do not have permission to perform this action"
+}
+```
+
+---
+
+## Security Considerations
+
+### Authentication
+
+- Use Laravel Sanctum for API token authentication
+- Tokens stored hashed in database
+- Token expiration configurable
+- Revoke tokens on logout
+
+### Authorization
+
+- Use Laravel Policies for resource authorization
+- Users can only access their own orders
+- Admin routes protected by middleware
+
+### Data Protection
+
+- Passwords hashed using bcrypt
+- Sensitive data encrypted at rest
+- HTTPS enforced in production
+- CORS configured for allowed origins
+
+### Payment Security
+
+- Never store full card numbers
+- Use Stripe.js for client-side tokenization
+- Verify webhook signatures
+- Use idempotency keys for payments
+
+### Rate Limiting
+
+| Endpoint | Limit |
+|----------|-------|
+| /login | 5 requests/minute |
+| /register | 3 requests/minute |
+| /cart/* | 30 requests/minute |
+| /checkout | 10 requests/minute |
+| General API | 60 requests/minute |
+
+### Input Validation
+
+- All inputs validated via Form Requests
+- SQL injection prevented via Eloquent
+- XSS prevented via response encoding
+- CSRF protection for web routes
+
+---
+
+## Docker Configuration
+
+This section walks through the complete Docker setup step by step.
+
+### Project File Structure
+
+```
+project-root/
+├── docker/
+│   ├── php/
+│   │   ├── Dockerfile
+│   │   └── php.ini
+│   ├── nginx/
+│   │   └── default.conf
+│   └── mysql/
+│       └── my.cnf
+├── docker-compose.yml        ← used for local development
+├── docker-compose.prod.yml   ← production only (see Production section)
+├── .env                      ← local values, never committed
+└── .env.example              ← committed, all keys with empty values
+```
+
+---
+
+### Step 1 — PHP-FPM Dockerfile
+
+`docker/php/Dockerfile`
+
+```dockerfile
+FROM php:8.3-fpm-alpine
+
+# System dependencies
+RUN apk add --no-cache \
+    bash \
+    curl \
+    git \
+    unzip \
+    oniguruma-dev \
+    libpng-dev \
+    libjpeg-turbo-dev \
+    freetype-dev \
+    libxml2-dev \
+    icu-dev \
+    linux-headers \
+    $PHPIZE_DEPS
+
+# PHP extensions
+RUN docker-php-ext-install \
+    pdo_mysql \
+    mbstring \
+    bcmath \
+    xml \
+    intl \
+    opcache
+
+# Redis extension
+RUN pecl install redis && docker-php-ext-enable redis
+
+# GD
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install gd
+
+# Composer
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /var/www/html
+
+COPY docker/php/php.ini /usr/local/etc/php/conf.d/custom.ini
+
+EXPOSE 9000
+CMD ["php-fpm"]
+```
+
+---
+
+### Step 2 — PHP Configuration
+
+`docker/php/php.ini`
+
+```ini
+; Error handling (local: errors visible for debugging)
+display_errors = On
+log_errors = On
+error_log = /var/log/php/error.log
+
+; Performance
+memory_limit = 256M
+max_execution_time = 60
+upload_max_filesize = 20M
+post_max_size = 25M
+
+; OPcache (local: validate_timestamps=1 so file changes are picked up immediately)
+opcache.enable = 1
+opcache.memory_consumption = 128
+opcache.interned_strings_buffer = 8
+opcache.max_accelerated_files = 10000
+opcache.revalidate_freq = 0
+opcache.validate_timestamps = 1
+```
+
+---
+
+### Step 3 — Nginx Configuration
+
+`docker/nginx/default.conf`
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+    root /var/www/html/public;
+    index index.php;
+
+    # Max upload size
+    client_max_body_size 25M;
+
+    # Gzip
+    gzip on;
+    gzip_types text/plain application/json application/javascript text/css;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass app:9000;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_read_timeout 60;
+    }
+
+    location ~ /\.(?!well-known).* {
+        deny all;
+    }
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+    add_header X-XSS-Protection "1; mode=block";
+}
+```
+
+---
+
+### Step 4 — MySQL Configuration
+
+`docker/mysql/my.cnf`
+
+```ini
+[mysqld]
+character-set-server  = utf8mb4
+collation-server      = utf8mb4_unicode_ci
+default-authentication-plugin = mysql_native_password
+
+# Performance
+innodb_buffer_pool_size = 256M
+innodb_log_file_size    = 64M
+innodb_flush_log_at_trx_commit = 1
+max_connections         = 100
+slow_query_log          = 1
+slow_query_log_file     = /var/log/mysql/slow.log
+long_query_time         = 1
+
+[client]
+default-character-set = utf8mb4
+```
+
+---
+
+### Step 5 — docker-compose.yml (Development)
+
+`docker-compose.yml`
+
+```yaml
+services:
+
+  # ── PHP-FPM ──────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: ecommerce_app
+    restart: unless-stopped
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+      - ./docker/php/php.ini:/usr/local/etc/php/conf.d/custom.ini
+    environment:
+      - APP_ENV=local
+    networks:
+      - ecommerce_network
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Nginx ─────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: ecommerce_nginx
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - .:/var/www/html
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - ecommerce_network
+    depends_on:
+      - app
+
+  # ── MySQL ─────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: ecommerce_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/my.cnf:/etc/mysql/conf.d/custom.cnf
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ecommerce_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Queue Worker ──────────────────────────────────────────
+  queue:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: ecommerce_queue
+    restart: unless-stopped
+    working_dir: /var/www/html
+    command: php artisan queue:work redis --sleep=3 --tries=3 --max-time=3600
+    volumes:
+      - .:/var/www/html
+    networks:
+      - ecommerce_network
+    depends_on:
+      - app
+      - redis
+
+  # ── Scheduler ─────────────────────────────────────────────
+  scheduler:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    container_name: ecommerce_scheduler
+    restart: unless-stopped
+    working_dir: /var/www/html
+    command: sh -c "while true; do php artisan schedule:run --verbose --no-interaction & sleep 60; done"
+    volumes:
+      - .:/var/www/html
+    networks:
+      - ecommerce_network
+    depends_on:
+      - app
+
+volumes:
+  mysql_data:
+  redis_data:
+
+networks:
+  ecommerce_network:
+    driver: bridge
+```
+
+---
+
+### Step 6 — Environment Variables
+
+`.env` (development defaults)
+
+```dotenv
+APP_NAME="Laravel E-Commerce"
+APP_ENV=local
+APP_KEY=
+APP_DEBUG=true
+APP_URL=http://localhost:8000
+
+# Database
+DB_CONNECTION=mysql
+DB_HOST=mysql
+DB_PORT=3306
+DB_DATABASE=ecommerce
+DB_USERNAME=ecommerce
+DB_PASSWORD=secret
+DB_ROOT_PASSWORD=rootsecret
+
+# Redis
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=redissecret
+
+# Cache / Queue / Session
+CACHE_DRIVER=redis
+QUEUE_CONNECTION=redis
+SESSION_DRIVER=redis
+
+# Stripe
+STRIPE_KEY=pk_test_...
+STRIPE_SECRET=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+> **Never commit `.env` to version control.** Provide `.env.example` with the same keys but empty sensitive values.
+
+---
+
+### Step 7 — Production Docker Overrides
+
+`docker-compose.prod.yml` is only used on the server. It disables bind mounts, unexposes DB/Redis ports, and enables SSL. See the **[Production](#production)** section for the full file and deployment steps.
+
+---
+
+### Step 8 — First-Run Bootstrap (Local)
+
+After containers are up for the first time:
+
+```bash
+# 1. Install PHP dependencies (include dev deps for testing/debugging)
+docker compose exec app composer install
+
+# 2. Generate application key
+docker compose exec app php artisan key:generate
+
+# 3. Run database migrations
+docker compose exec app php artisan migrate
+
+# 4. Seed database with sample data
+docker compose exec app php artisan db:seed
+
+# 5. Set storage permissions
+docker compose exec app chmod -R 775 storage bootstrap/cache
+
+# 6. Verify the app is responding
+curl http://localhost:8000/api/v1/health
+```
+
+> Do **not** run `config:cache`, `route:cache`, or `view:cache` locally — these freeze your files and changes won't be picked up without re-caching. Use them in production only (see Production section).
+
+---
+
+### Step 9 — Common Dev Commands
+
+| Task | Command |
+|------|---------|
+| Start all services | `docker compose up -d` |
+| Stop all services | `docker compose down` |
+| View logs | `docker compose logs -f` |
+| Laravel Artisan | `docker compose exec app php artisan <cmd>` |
+| Open MySQL shell | `docker compose exec mysql mysql -u ecommerce -p ecommerce` |
+| Open Redis CLI | `docker compose exec redis redis-cli -a $REDIS_PASSWORD` |
+| Run tests | `docker compose exec app php artisan test` |
+| Clear all caches | `docker compose exec app php artisan optimize:clear` |
+| Fresh migration + seed | `docker compose exec app php artisan migrate:fresh --seed` |
+
+---
+
+### Step 10 — Container Diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Docker Network (bridge)                   │
+│                                                              │
+│  ┌───────────────┐     ┌───────────────┐                    │
+│  │     nginx     │────>│      app      │ (PHP-FPM 8.3)      │
+│  │  :80 / :443   │     │    :9000      │                    │
+│  └───────────────┘     └──────┬────────┘                    │
+│         ▲                     │                              │
+│         │ HTTP                ├──────────────────────────>  │
+│      Client             ┌─────▼──────┐   ┌──────────────┐  │
+│                         │   mysql    │   │    redis     │  │
+│                         │   :3306    │   │    :6379     │  │
+│                         └────────────┘   └──────────────┘  │
+│                                               ▲             │
+│  ┌───────────────┐     ┌───────────────┐      │             │
+│  │   scheduler   │     │     queue     │──────┘             │
+│  │  (artisan)    │     │  (worker)     │                    │
+│  └───────────────┘     └───────────────┘                    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Appendix
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| APP_ENV | Environment (local/production) |
+| APP_KEY | Application encryption key |
+| APP_DEBUG | Debug mode (false in production) |
+| DB_CONNECTION | Database driver |
+| DB_HOST | Database host |
+| DB_DATABASE | Database name |
+| DB_USERNAME | Database user |
+| DB_PASSWORD | Database password |
+| REDIS_HOST | Redis host |
+| STRIPE_KEY | Stripe publishable key |
+| STRIPE_SECRET | Stripe secret key |
+| STRIPE_WEBHOOK_SECRET | Stripe webhook secret |
+
+### Tax Calculation
+
+- Default tax rate: 10%
+- Applied to subtotal
+- Formula: `tax = subtotal * 0.10`
+- Total: `total = subtotal + tax`
+
+### Order Number Format
+
+- Prefix: `ORD-`
+- Followed by: Uppercase unique ID
+- Example: `ORD-65A8B3C2`
+- Generated using: `uniqid()`
+
+---
+
+## Testing
+
+### Strategy Overview
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                     Test Pyramid                          │
+│                                                          │
+│                        ▲                                 │
+│                       /E\                                │
+│                      / 2E\    E2E / Feature Tests        │
+│                     /─────\                              │
+│                    / Integ \                             │
+│                   /  ation  \  Integration Tests         │
+│                  /───────────\                           │
+│                 /    Unit     \                          │
+│                /──────────────\ Unit Tests               │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+| Layer | Tool | Purpose |
+|-------|------|---------|
+| Unit | PHPUnit + Laravel TestCase | Test isolated classes (Actions, DTOs, Enums) |
+| Integration | PHPUnit + RefreshDatabase | Test repositories, services against a real DB |
+| Feature | PHPUnit + Laravel HTTP tests | Test full HTTP request → response cycle |
+
+---
+
+### Step 1 — Test Configuration
+
+`phpunit.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         stopOnFailure="false">
+
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+
+    <coverage>
+        <include>
+            <directory suffix=".php">app</directory>
+        </include>
+        <report>
+            <html outputDirectory="coverage"/>
+            <clover outputFile="coverage/clover.xml"/>
+        </report>
+    </coverage>
+
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="DB_CONNECTION" value="sqlite"/>
+        <env name="DB_DATABASE" value=":memory:"/>
+        <env name="CACHE_DRIVER" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="STRIPE_KEY" value="pk_test_fake"/>
+        <env name="STRIPE_SECRET" value="sk_test_fake"/>
+    </php>
+</phpunit>
+```
+
+> Uses **SQLite in-memory** for tests — fast, no external dependency. Stripe calls are mocked.
+
+---
+
+### Step 2 — Test Directory Structure
+
+```
+tests/
+├── Unit/
+│   ├── Actions/
+│   │   ├── CreateOrderActionTest.php
+│   │   ├── AddToCartActionTest.php
+│   │   └── ProcessPaymentActionTest.php
+│   ├── Models/
+│   │   ├── OrderTest.php
+│   │   └── CartTest.php
+│   └── Enums/
+│       ├── OrderStatusTest.php
+│       └── PaymentStatusTest.php
+├── Feature/
+│   ├── Auth/
+│   │   ├── RegisterTest.php
+│   │   ├── LoginTest.php
+│   │   └── LogoutTest.php
+│   ├── Products/
+│   │   └── ProductListingTest.php
+│   ├── Cart/
+│   │   ├── AddToCartTest.php
+│   │   ├── UpdateCartItemTest.php
+│   │   ├── RemoveCartItemTest.php
+│   │   └── ClearCartTest.php
+│   ├── Checkout/
+│   │   ├── CheckoutTest.php
+│   │   └── StockValidationTest.php
+│   ├── Orders/
+│   │   ├── OrderListTest.php
+│   │   ├── OrderDetailTest.php
+│   │   └── CancelOrderTest.php
+│   └── Payments/
+│       ├── ProcessPaymentTest.php
+│       └── StripeWebhookTest.php
+└── TestCase.php
+```
+
+---
+
+### Step 3 — Unit Test Examples
+
+**Testing Order State Transitions**
+
+```php
+// tests/Unit/Enums/OrderStatusTest.php
+class OrderStatusTest extends TestCase
+{
+    public function test_pending_can_transition_to_processing(): void
+    {
+        $order = Order::factory()->make(['status' => OrderStatus::Pending]);
+        $this->assertTrue($order->canTransitionTo(OrderStatus::Processing));
+    }
+
+    public function test_completed_cannot_be_cancelled(): void
+    {
+        $order = Order::factory()->make(['status' => OrderStatus::Completed]);
+        $this->assertFalse($order->canTransitionTo(OrderStatus::Cancelled));
+    }
+}
+```
+
+**Testing Cart Totals**
+
+```php
+// tests/Unit/Models/CartTest.php
+class CartTest extends TestCase
+{
+    public function test_subtotal_is_sum_of_item_totals(): void
+    {
+        $cart  = Cart::factory()->make();
+        $items = CartItem::factory()->count(2)->make([
+            'quantity' => 2,
+            // products priced at 50.00 each
+        ]);
+        $this->assertEquals('200.00', $cart->subtotal($items));
+    }
+
+    public function test_tax_is_ten_percent_of_subtotal(): void
+    {
+        $this->assertEquals('20.00', Cart::calculateTax('200.00'));
+    }
+}
+```
+
+---
+
+### Step 4 — Feature Test Examples
+
+**Authentication**
+
+```php
+// tests/Feature/Auth/RegisterTest.php
+class RegisterTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_user_can_register(): void
+    {
+        $response = $this->postJson('/api/v1/register', [
+            'name'                  => 'John Doe',
+            'email'                 => 'john@example.com',
+            'password'              => 'password123',
+            'password_confirmation' => 'password123',
+        ]);
+
+        $response->assertStatus(201)
+                 ->assertJsonStructure(['data' => ['user', 'token']]);
+
+        $this->assertDatabaseHas('users', ['email' => 'john@example.com']);
+    }
+
+    public function test_duplicate_email_is_rejected(): void
+    {
+        User::factory()->create(['email' => 'john@example.com']);
+
+        $this->postJson('/api/v1/register', [
+            'name'                  => 'Jane',
+            'email'                 => 'john@example.com',
+            'password'              => 'password123',
+            'password_confirmation' => 'password123',
+        ])->assertStatus(422);
+    }
+}
+```
+
+**Cart**
+
+```php
+// tests/Feature/Cart/AddToCartTest.php
+class AddToCartTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_authenticated_user_can_add_item_to_cart(): void
+    {
+        $user    = User::factory()->create();
+        $product = Product::factory()->create(['stock' => 10, 'is_active' => true]);
+
+        $this->actingAs($user)
+             ->postJson('/api/v1/cart/items', [
+                 'product_id' => $product->id,
+                 'quantity'   => 2,
+             ])
+             ->assertStatus(200)
+             ->assertJsonPath('data.items_count', 2);
+
+        $this->assertDatabaseHas('cart_items', [
+            'product_id' => $product->id,
+            'quantity'   => 2,
+        ]);
+    }
+
+    public function test_adding_same_product_merges_quantity(): void
+    {
+        $user    = User::factory()->create();
+        $product = Product::factory()->create(['stock' => 20]);
+
+        $this->actingAs($user)->postJson('/api/v1/cart/items', ['product_id' => $product->id, 'quantity' => 2]);
+        $this->actingAs($user)->postJson('/api/v1/cart/items', ['product_id' => $product->id, 'quantity' => 3]);
+
+        $this->assertDatabaseHas('cart_items', ['product_id' => $product->id, 'quantity' => 5]);
+    }
+
+    public function test_guest_cannot_add_to_cart(): void
+    {
+        $product = Product::factory()->create();
+
+        $this->postJson('/api/v1/cart/items', ['product_id' => $product->id, 'quantity' => 1])
+             ->assertStatus(401);
+    }
+}
+```
+
+**Checkout — Stock Validation**
+
+```php
+// tests/Feature/Checkout/StockValidationTest.php
+class StockValidationTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_checkout_fails_when_stock_is_insufficient(): void
+    {
+        $user    = User::factory()->create();
+        $product = Product::factory()->create(['price' => 50.00, 'stock' => 1]);
+
+        // Add 2 units to cart but only 1 in stock
+        CartItem::factory()->create([
+            'cart_id'    => Cart::factory()->create(['user_id' => $user->id]),
+            'product_id' => $product->id,
+            'quantity'   => 2,
+        ]);
+
+        $this->actingAs($user)
+             ->postJson('/api/v1/checkout', ['payment_method' => 'stripe'])
+             ->assertStatus(422)
+             ->assertJsonPath('success', false);
+    }
+}
+```
+
+**Stripe Webhook**
+
+```php
+// tests/Feature/Payments/StripeWebhookTest.php
+class StripeWebhookTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_payment_succeeded_webhook_marks_order_processing(): void
+    {
+        $order   = Order::factory()->create(['status' => OrderStatus::Pending]);
+        $payment = Payment::factory()->create(['order_id' => $order->id, 'status' => 'pending']);
+
+        $payload   = $this->buildStripeEvent('payment_intent.succeeded', $payment->transaction_id);
+        $signature = $this->generateStripeSignature($payload);
+
+        $this->postJson('/api/v1/webhooks/stripe', $payload, ['Stripe-Signature' => $signature])
+             ->assertStatus(200);
+
+        $this->assertDatabaseHas('orders',   ['id' => $order->id,   'status' => 'processing']);
+        $this->assertDatabaseHas('payments', ['id' => $payment->id, 'status' => 'paid']);
+    }
+}
+```
+
+---
+
+### Step 5 — Running Tests
+
+```bash
+# Run all tests
+docker compose exec app php artisan test
+
+# Run a specific suite
+docker compose exec app php artisan test --testsuite=Feature
+
+# Run a specific file
+docker compose exec app php artisan test tests/Feature/Cart/AddToCartTest.php
+
+# Run with coverage report
+docker compose exec app php artisan test --coverage --min=80
+
+# Run in parallel (faster)
+docker compose exec app php artisan test --parallel
+```
+
+### Coverage Targets
+
+| Area | Minimum Coverage |
+|------|-----------------|
+| Actions / Business Logic | 90% |
+| Models | 80% |
+| HTTP Controllers | 80% |
+| Overall | 80% |
+
+---
+
+## CI/CD
+
+### Pipeline Overview
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│  Push /  │    │   Lint   │    │   Test   │    │  Build   │    │  Deploy  │
+│   PR     │───>│ & Static │───>│  Suite   │───>│  Image   │───>│  Stage / │
+│          │    │ Analysis │    │          │    │          │    │   Prod   │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+```
+
+### Step 1 — GitHub Actions Workflow
+
+`.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+
+  # ── Lint & Static Analysis ────────────────────────────────
+  lint:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_sqlite, redis
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Run PHP CS Fixer (code style)
+        run: vendor/bin/pint --test
+
+      - name: Run PHPStan (static analysis)
+        run: vendor/bin/phpstan analyse --level=8
+
+  # ── Test Suite ────────────────────────────────────────────
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_sqlite, redis
+          coverage: xdebug
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Copy environment file
+        run: cp .env.example .env.testing
+
+      - name: Generate application key
+        run: php artisan key:generate --env=testing
+
+      - name: Run tests with coverage
+        run: php artisan test --parallel --coverage-clover coverage/clover.xml --min=80
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ":memory:"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage/clover.xml
+
+  # ── Build Docker Image ────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/app
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/php/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+---
+
+### Step 2 — CD Deploy Workflow
+
+The CD workflow (`.github/workflows/deploy.yml`) SSH-deploys the built image to the server on every push to `main`. See the **[Production](#production)** section for the full workflow file.
+
+---
+
+### Step 3 — Branch & Environment Strategy
+
+```
+main ──────────────────────────────────────────> Production
+  │
+  └── develop ──────────────────────────────────> Staging
+        │
+        ├── feature/cart-feature ─> PR → develop
+        ├── feature/payment-flow ─> PR → develop
+        └── fix/stock-race-condition ─> PR → develop
+```
+
+| Branch | Trigger | Target Environment |
+|--------|---------|-------------------|
+| `feature/*` | Push | CI only (lint + test) |
+| `develop` | Merge | CI + deploy to **staging** |
+| `main` | Merge | CI + deploy to **production** |
+
+---
+
+### Step 4 — Pull Request Checks
+
+Every PR must pass before merge:
+
+| Check | Tool | Required |
+|-------|------|----------|
+| Code style | Laravel Pint | Yes |
+| Static analysis | PHPStan level 8 | Yes |
+| Unit + Feature tests | PHPUnit | Yes |
+| Coverage ≥ 80% | Xdebug + Codecov | Yes |
+| No secrets committed | Gitleaks | Yes |
+| Docker image builds | docker build | Yes |
+
+---
+
+### Step 5 — Secrets Management
+
+Store all sensitive values as GitHub Actions secrets, never in the repo. See the **[Production](#production)** section for the full secrets table.
+
+---
+
+## Deployment
+
+> All deployment steps live in the **[Production](#production)** section at the bottom of this document. Nothing here applies to local development.
+
+---
+
+---
+
+# Production
+
+> Everything below this line applies **only to the production server**. None of it is needed to run the project locally.
+
+---
+
+## Production Architecture
+
+```
+Internet
+    │
+    ▼  HTTPS (:443)
+┌─────────────────────────────────────────────────────────┐
+│                   Cloud Server (VPS)                     │
+│                                                         │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │              Docker Compose (Prod)               │   │
+│  │                                                  │   │
+│  │  nginx (:443, SSL Termination + Load Balance)    │   │
+│  │       ──> app (PHP-FPM)                          │   │
+│  │                  │                               │   │
+│  │         ┌────────┴────────┐                      │   │
+│  │       mysql            redis                     │   │
+│  │                           │                      │   │
+│  │         queue worker   scheduler                 │   │
+│  └──────────────────────────────────────────────────┘   │
+│                                                         │
+│  SSL: Let's Encrypt (Certbot, auto-renew)               │
+│  Backups: Automated daily → S3                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+Key differences from local:
+- Nginx handles **SSL termination** (HTTPS on :443) and can **load balance** across multiple `app` containers
+- No bind mounts — app code is baked into the Docker image
+- DB and Redis ports are **not exposed** to the host
+- `APP_DEBUG=false`, `display_errors=Off`, OPcache `validate_timestamps=0`
+- Config/route/view caches are active (`php artisan optimize`)
+
+---
+
+## Production — Docker
+
+### docker-compose.prod.yml
+
+Applied on top of `docker-compose.yml` using:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+```yaml
+services:
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: production
+    restart: always
+    environment:
+      - APP_ENV=production
+    volumes: []          # No bind mount — image contains the code
+
+  nginx:
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - /etc/letsencrypt:/etc/letsencrypt:ro   # SSL certificates
+
+  mysql:
+    restart: always
+    ports: []            # Not exposed publicly in production
+
+  redis:
+    restart: always
+    ports: []            # Not exposed publicly in production
+
+  queue:
+    restart: always
+
+  scheduler:
+    restart: always
+```
+
+### Production php.ini overrides
+
+Change these values from the local `php.ini` on the production image:
+
+```ini
+display_errors = Off
+opcache.revalidate_freq = 60
+opcache.validate_timestamps = 0   ; do not re-check files on every request
+```
+
+### Production Nginx Config
+
+`docker/nginx/default.conf` on the server — replaces the local version:
+
+```nginx
+server {
+    listen 80;
+    server_name api.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    root /var/www/html/public;
+    index index.php;
+
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass app:9000;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options "SAMEORIGIN";
+    add_header X-Content-Type-Options "nosniff";
+}
+```
+
+---
+
+## Production — CI/CD
+
+### CD Deploy Workflow
+
+`.github/workflows/deploy.yml` — runs automatically on every push to `main`:
+
+```yaml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /srv/ecommerce
+
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml pull app
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-deps app
+            docker compose exec -T app php artisan migrate --force
+            docker compose exec -T app php artisan optimize
+```
+
+### GitHub Actions Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `SERVER_HOST` | VPS IP / hostname |
+| `SERVER_USER` | SSH deploy user |
+| `SERVER_SSH_KEY` | Private key for SSH access |
+| `DB_PASSWORD` | Production DB password |
+| `REDIS_PASSWORD` | Production Redis password |
+| `STRIPE_SECRET` | Live Stripe secret key |
+| `STRIPE_WEBHOOK_SECRET` | Live Stripe webhook secret |
+| `APP_KEY` | Laravel app encryption key |
+
+---
+
+## Production — Deployment Steps
+
+### Step 1 — Server Provisioning
+
+```bash
+# Update system
+apt update && apt upgrade -y
+
+# Install Docker + Compose
+curl -fsSL https://get.docker.com | bash
+apt install docker-compose-plugin -y
+
+# Create deploy user
+useradd -m -s /bin/bash deploy
+usermod -aG docker deploy
+
+# Add CI public key
+mkdir -p /home/deploy/.ssh
+echo "<CI_PUBLIC_KEY>" >> /home/deploy/.ssh/authorized_keys
+chmod 700 /home/deploy/.ssh && chmod 600 /home/deploy/.ssh/authorized_keys
+
+# Create app directory
+mkdir -p /srv/ecommerce
+chown deploy:deploy /srv/ecommerce
+```
+
+### Step 2 — SSL with Let's Encrypt
+
+```bash
+apt install certbot python3-certbot-nginx -y
+
+# Domain must already point to this server
+certbot certonly --standalone -d api.example.com
+
+# Verify auto-renew timer
+systemctl status certbot.timer
+```
+
+### Step 3 — Production .env on Server
+
+Create `/srv/ecommerce/.env` directly on the server — **never committed to the repo**:
+
+```dotenv
+APP_NAME="Laravel E-Commerce"
+APP_ENV=production
+APP_KEY=base64:GENERATED_KEY_HERE
+APP_DEBUG=false
+APP_URL=https://api.example.com
+
+DB_CONNECTION=mysql
+DB_HOST=mysql
+DB_PORT=3306
+DB_DATABASE=ecommerce
+DB_USERNAME=ecommerce
+DB_PASSWORD=STRONG_PASSWORD_HERE
+DB_ROOT_PASSWORD=STRONG_ROOT_PASSWORD_HERE
+
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=STRONG_REDIS_PASSWORD_HERE
+
+CACHE_DRIVER=redis
+QUEUE_CONNECTION=redis
+SESSION_DRIVER=redis
+
+STRIPE_KEY=pk_live_...
+STRIPE_SECRET=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
+
+```bash
+chmod 600 /srv/ecommerce/.env
+```
+
+### Step 4 — Initial Deploy
+
+```bash
+cd /srv/ecommerce
+git clone https://github.com/your-org/ecommerce.git .
+
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+docker compose exec app composer install --no-dev --optimize-autoloader
+docker compose exec app php artisan key:generate --force
+docker compose exec app php artisan migrate --force
+docker compose exec app php artisan optimize
+
+docker compose ps
+```
+
+### Step 5 — Zero-Downtime Redeploy (Manual)
+
+CI/CD handles this automatically. For manual deploys:
+
+```bash
+cd /srv/ecommerce
+
+docker compose -f docker-compose.yml -f docker-compose.prod.yml pull app
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --no-deps app
+docker compose exec -T app php artisan migrate --force
+docker compose exec -T app php artisan optimize
+```
+
+### Step 6 — Database Backups
+
+`/srv/ecommerce/scripts/backup.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+BACKUP_DIR=/srv/backups
+CONTAINER=ecommerce_mysql
+
+mkdir -p "$BACKUP_DIR"
+
+docker exec "$CONTAINER" \
+  mysqldump -u root -p"${DB_ROOT_PASSWORD}" ecommerce \
+  | gzip > "$BACKUP_DIR/ecommerce_$DATE.sql.gz"
+
+aws s3 cp "$BACKUP_DIR/ecommerce_$DATE.sql.gz" s3://your-bucket/db-backups/
+
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +30 -delete
+
+echo "Backup complete: ecommerce_$DATE.sql.gz"
+```
+
+Schedule via cron (daily 2 AM):
+
+```
+0 2 * * * /srv/ecommerce/scripts/backup.sh >> /var/log/db-backup.log 2>&1
+```
+
+### Step 7 — Health Checks & Monitoring
+
+**Health endpoint** `GET /health` (public, no auth):
+
+```json
+{
+  "status": "ok",
+  "services": { "database": "ok", "redis": "ok", "queue": "ok" },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+| Tool | Purpose |
+|------|---------|
+| UptimeRobot / BetterStack | Ping `/health` every minute, alert on failure |
+| Sentry | Exception tracking and alerting |
+| Docker json-file logging | `max-size: 10m`, `max-file: 5` per container |
+
+### Deployment Checklist
+
+Before every production release:
+
+- [ ] All CI checks pass (lint, static analysis, tests, coverage ≥ 80%)
+- [ ] No `.env` or secrets in committed code
+- [ ] Migrations are backwards-compatible
+- [ ] Stripe webhook secret updated if rotating keys
+- [ ] SSL certificate valid (`certbot renew --dry-run`)
+- [ ] Health endpoint returns `200 ok` after deploy
+- [ ] Previous image tag noted for rollback
