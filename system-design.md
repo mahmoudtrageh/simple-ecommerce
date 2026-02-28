@@ -20,6 +20,7 @@
 16. [CI/CD](#cicd)
 17. [Deployment](#deployment)
 18. [Design Patterns, SOLID, OOP & Programming Fundamentals](#design-patterns-solid-oop--programming-fundamentals)
+19. [Additional Engineering Practices](#additional-engineering-practices)
 
 ---
 
@@ -2624,6 +2625,470 @@ Concrete examples:
 - Caching lives in the cart service layer, not inside the `Cart` Eloquent model.
 - Input validation lives in `FormRequest` classes, not inside Actions.
 - Email dispatch lives in `SendOrderConfirmationListener`, not in `CreateOrderAction` — email must not block the checkout database transaction.
+
+---
+
+## Additional Engineering Practices
+
+### Query Optimisation & the N+1 Problem
+
+**What N+1 is:** issuing 1 query to fetch N rows, then N additional queries to fetch related data — one per row.
+
+```
+// N+1 — BAD
+$orders = Order::all();          // 1 query
+foreach ($orders as $order) {
+    $order->items;               // N queries (one per order)
+}
+
+// Eager-loaded — GOOD
+$orders = Order::with('items.product')->get();  // 2 queries total
+```
+
+**Real examples in this project:**
+
+| Endpoint | Relationship to eager-load | Eloquent call |
+|----------|---------------------------|---------------|
+| `GET /orders` | items + each item's product | `Order::with('items.product')` |
+| `GET /orders/{id}` | same | `Order::with('items.product')->findOrFail($id)` |
+| `GET /cart` | cartItems + each item's product | `Cart::with('items.product')` |
+
+**`with()` vs `load()`:**
+- `with('items')` — eager-load before the query runs; use when building a new query.
+- `$order->load('items')` — lazy eager-load on an already-retrieved model; use when you receive a model instance and need to add relations.
+
+**Detecting N+1 in tests:**
+
+```php
+DB::enableQueryLog();
+$response = $this->getJson('/api/orders');
+$queryCount = count(DB::getQueryLog());
+$this->assertLessThanOrEqual(5, $queryCount, 'N+1 detected on GET /orders');
+```
+
+**Local profiling:** Laravel Debugbar (`barryvdh/laravel-debugbar`) and Telescope both display query counts per request.
+
+**Index recap:** Foreign key columns (`cart_items.product_id`, `order_items.order_id`, etc.) are indexed by default. An additional compound index on `(is_active, stock)` in the `products` table benefits the product-listing query with `WHERE is_active = 1 AND stock > 0`.
+
+---
+
+### Transaction Isolation Levels
+
+MySQL supports four isolation levels (in ascending strictness):
+
+| Level | Dirty Read | Non-Repeatable Read | Phantom Read |
+|-------|-----------|---------------------|--------------|
+| READ UNCOMMITTED | possible | possible | possible |
+| READ COMMITTED | prevented | possible | possible |
+| **REPEATABLE READ** *(MySQL default)* | prevented | prevented | possible* |
+| SERIALIZABLE | prevented | prevented | prevented |
+
+\* InnoDB partially prevents phantom reads via gap locks, but not fully under all conditions.
+
+**Why `lockForUpdate()` is still needed (checkout flow):**
+
+Under REPEATABLE READ, a transaction reads a consistent snapshot from its start time — it will not see updates committed by other transactions. However, two concurrent checkouts can both read `stock = 1`, both pass the validation, and both attempt to decrement. `lockForUpdate()` (pessimistic lock) acquires an exclusive row lock:
+
+```php
+// Inside CreateOrderAction — stock check with lock
+$product = Product::lockForUpdate()->findOrFail($productId);
+if ($product->stock < $quantity) {
+    throw new InsufficientStockException($product);
+}
+$product->decrement('stock', $quantity);
+```
+
+The second concurrent transaction blocks on `lockForUpdate()` until the first commits, then reads the updated stock.
+
+**Optimistic locking (version column):** an alternative for low-contention scenarios. Add a `version` integer column; on update, check `WHERE id = ? AND version = ?` and increment it. If 0 rows affected, another transaction won — retry. Not suitable for checkout (high-contention, must not silently retry a payment).
+
+**Deadlock anatomy:** Transaction A locks `products` row 1, then `order_items`. Transaction B locks `order_items`, then `products` row 1. Each waits for the other → deadlock. MySQL detects it, rolls back the younger transaction, and throws `PDOException` with error code 1213. Laravel's `DB::transaction()` retries automatically on deadlock (default 1 retry).
+
+**Rule:** keep transactions short. Never call Stripe inside the DB transaction — Stripe is invoked in `ProcessPaymentAction` *after* `CreateOrderAction` has committed.
+
+---
+
+### Advanced Caching Concerns
+
+**Cache stampede (thundering herd):**
+When a cached key expires, dozens of simultaneous requests all find a cold cache and hammer the database concurrently to recompute the value.
+
+Fix — use an atomic lock so only one process recomputes:
+
+```php
+$cart = Cache::remember("cart:{$userId}", 3600, function () use ($userId) {
+    // Without a lock, all waiting requests run this simultaneously on cold cache
+    return Cart::with('items.product')->where('user_id', $userId)->first();
+});
+
+// Better — with distributed lock
+$value = Cache::lock("lock:cart:{$userId}", 10)->block(5, function () use ($userId) {
+    return Cache::remember("cart:{$userId}", 3600, fn() =>
+        Cart::with('items.product')->where('user_id', $userId)->first()
+    );
+});
+```
+
+**Key versioning:** when a schema or data-shape change would make cached values invalid, prefix keys with a version rather than flushing the entire cache:
+
+```
+cart:v1:{user_id}   →   cart:v2:{user_id}
+```
+
+Bumping `v1` to `v2` in application code instantly makes all old keys orphaned (they expire naturally) without a Redis FLUSHDB that would briefly take every cache miss at once.
+
+**Stale-while-revalidate:** for non-critical reads (e.g., product listings), serve the stale cached value immediately and dispatch a background job to refresh it. Keeps response times low even during cache refresh.
+
+**TTL selection rationale:**
+
+| Key | TTL | Reasoning |
+|-----|-----|-----------|
+| `cart:{user_id}` | 1 hour | Session-like; user is likely actively shopping |
+| `products:catalog` | 5 minutes | Catalog changes rarely; stale data is acceptable briefly |
+| Auth tokens | Session length | Must not outlive the session |
+
+**Redis eviction policy:** set `maxmemory-policy allkeys-lru` in `redis.conf`. When Redis runs out of memory it evicts the least-recently-used key across all keys. Without a policy, Redis returns `OOM command not allowed` errors, breaking cache operations.
+
+---
+
+### Idempotency & Safe Retries
+
+**Definition:** an operation is idempotent if calling it multiple times produces the same result as calling it once.
+
+**Why it matters for checkout:** network timeouts, double-clicks, browser back-button, and mobile retries can all trigger duplicate POST requests to `/checkout`. Without idempotency, a user could be charged twice.
+
+**Implementation pattern:**
+
+1. Client sends a `Idempotency-Key: <uuid-v4>` header on every `POST /checkout` request.
+2. Server middleware checks `idempotency:{key}` in Redis before processing.
+   - Key exists → return the cached `{status, order_id, response_body}` immediately (no transaction, no Stripe call).
+   - Key absent → process normally, then cache `{status, order_id, response_body}` with a 24-hour TTL.
+3. Cached response is returned with the same HTTP status code as the original.
+
+```php
+// IdempotencyMiddleware.php
+$key = $request->header('Idempotency-Key');
+if ($key) {
+    $cached = Cache::get("idempotency:{$key}");
+    if ($cached) {
+        return response()->json($cached['body'], $cached['status']);
+    }
+}
+// ... process request ...
+Cache::put("idempotency:{$key}", ['status' => $status, 'body' => $body], now()->addHours(24));
+```
+
+**Stripe already does this:** when calling `PaymentIntents::create()`, pass an `idempotencyKey` matching the client's header. Stripe deduplicates on their end too.
+
+**Safe vs. unsafe operations:**
+
+| Method | Naturally idempotent? | Reason |
+|--------|----------------------|--------|
+| GET | Yes | Read-only |
+| DELETE | Yes | Deleting an already-deleted resource is a no-op |
+| PUT | Yes (if full replacement) | Same input produces same state |
+| POST /checkout | No | Creates order + charges card |
+| POST /cart/items | No | Adds quantity to cart |
+
+**`Retry-After` header:** always include on `429 Too Many Requests` responses so clients know how long to wait before retrying:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+```
+
+---
+
+### Structured Logging & Correlation IDs
+
+**Why plain-text logs fail at scale:** grepping free-text across thousands of lines per minute is slow, brittle, and impossible to aggregate. Structured (JSON) logs can be indexed, queried, and alerted on by tools like Sentry, Datadog, or the ELK stack.
+
+**Structured log format (JSON):**
+
+```json
+{
+  "level": "info",
+  "message": "Order created",
+  "order_id": "ORD-65A8B3C2",
+  "user_id": 42,
+  "total_amount": 129.99,
+  "duration_ms": 312,
+  "request_id": "a3f9d1b2-44c7-4e8a-9f01-bb2c3e4d5f67",
+  "timestamp": "2025-06-01T14:22:01Z"
+}
+```
+
+**Correlation / Request ID pattern:**
+
+1. `CorrelationIdMiddleware` generates a UUID at request entry (or reads `X-Request-Id` if the load balancer forwards one).
+2. The ID is pushed into Laravel's logging context so every log line in that request automatically includes it.
+3. The same ID is returned as `X-Request-Id` in the response header.
+4. When dispatching queue jobs, the ID is passed as a job property so async logs trace back to the originating HTTP request.
+
+```php
+// CorrelationIdMiddleware.php
+$requestId = $request->header('X-Request-Id', (string) Str::uuid());
+$request->headers->set('X-Request-Id', $requestId);
+
+Log::withContext(['request_id' => $requestId, 'user_id' => auth()->id()]);
+
+$response = $next($request);
+$response->headers->set('X-Request-Id', $requestId);
+return $response;
+```
+
+**Log levels — when to use each:**
+
+| Level | Use case | Example |
+|-------|----------|---------|
+| DEBUG | Development only; verbose internal state | SQL query parameters |
+| INFO | Normal business events | Order placed, payment succeeded |
+| WARNING | Recoverable anomalies worth monitoring | Cache miss spike, stock below threshold |
+| ERROR | Unhandled exceptions; requires attention | `CreateOrderAction` threw an unexpected exception |
+| CRITICAL | System health at risk | DB unreachable, Stripe integration broken |
+
+**What NOT to log:** passwords, full card numbers, raw Stripe secret keys, or any PII beyond what is operationally necessary (e.g., user ID is fine; full name in every log line is not).
+
+**Laravel implementation:**
+
+```php
+// config/logging.php — add JSON formatter to the stack channel
+'stack' => [
+    'driver'   => 'stack',
+    'channels' => ['daily'],
+],
+'daily' => [
+    'driver'    => 'daily',
+    'formatter' => Monolog\Formatter\JsonFormatter::class,
+    'path'      => storage_path('logs/laravel.log'),
+    'level'     => env('LOG_LEVEL', 'debug'),
+],
+```
+
+---
+
+### Graceful Degradation & Circuit Breaker
+
+**The problem:** if the Stripe API is slow or down, every `/checkout` request blocks waiting for an HTTP timeout, exhausting PHP-FPM workers and making the entire application unresponsive — even for users just browsing products.
+
+**Circuit Breaker states:**
+
+```
+CLOSED ──(N failures in window)──► OPEN ──(timeout + probe)──► HALF-OPEN
+  ▲                                                                  │
+  └──────────────────(probe succeeds)───────────────────────────────┘
+```
+
+- **CLOSED:** normal operation; failures are counted.
+- **OPEN:** all calls fail immediately with a cached error (fast-fail); no requests reach Stripe.
+- **HALF-OPEN:** one probe request is allowed through; if it succeeds, circuit closes; if it fails, stays open.
+
+**Applied to `StripeGateway`:**
+
+```php
+// Pseudocode
+$breaker = CircuitBreaker::for('stripe');
+
+if ($breaker->isOpen()) {
+    throw new PaymentServiceUnavailableException();  // returns 503 + Retry-After
+}
+
+try {
+    $result = $this->stripe->paymentIntents()->create($params);
+    $breaker->recordSuccess();
+} catch (ApiConnectionException $e) {
+    $breaker->recordFailure();
+    throw $e;
+}
+```
+
+**Graceful degradation tiers for this project:**
+
+| Dependency fails | Degraded behaviour | User impact |
+|-----------------|-------------------|-------------|
+| Stripe | Reject checkout with 503 + `Retry-After`; cart & browsing unaffected | Cannot complete purchase; can still shop |
+| Redis | Fall back to DB for cart reads (bypass `Cache::remember`); log WARNING | Slower cart reads; no data loss |
+| Queue worker | Events (e.g., `OrderPlaced`) land in `failed_jobs` table; retry via scheduler | Confirmation email delayed, not lost |
+| Read replica lag | Route all reads to primary temporarily | Slightly higher primary load |
+
+**Timeout discipline:** always configure explicit timeouts on external HTTP clients:
+
+```php
+// Stripe client config
+$stripe = new StripeClient([
+    'api_key'        => config('services.stripe.secret'),
+    'max_network_retries' => 2,
+    'http_client'    => new \Stripe\HttpClient\CurlClient([
+        CURLOPT_CONNECTTIMEOUT => 2,   // 2 seconds to establish connection
+        CURLOPT_TIMEOUT        => 10,  // 10 seconds total
+    ]),
+]);
+```
+
+**Laravel implementation:** `spatie/laravel-circuit-breaker` provides a Redis-backed counter, or implement manually with `Cache::increment("cb:stripe:failures")` and a TTL-based window.
+
+---
+
+### API Pagination & Filtering
+
+**Why it is required:** `GET /products` and `GET /orders` return unbounded result sets without pagination. A catalog with 10 000 products serialised to JSON in one response will time out, exhaust memory, and produce an unusable client experience.
+
+**Offset-based vs. cursor-based:**
+
+| | Offset (`?page=2&per_page=20`) | Cursor (`?cursor=eyJpZCI6MTAwfQ`) |
+|-|-------------------------------|----------------------------------|
+| Implementation | `LIMIT 20 OFFSET 20` | `WHERE id > 100 LIMIT 20` |
+| Performance on large tables | Degrades (MySQL scans skipped rows) | Constant (index seek) |
+| Stability during inserts | Unstable (row inserted on page 1 shifts page 2) | Stable |
+| Navigability | Random page access | Forward/backward only |
+| Use case | Small, stable datasets | Append-only feeds, large datasets |
+
+**Decision for this project:**
+- `GET /products` — **offset pagination** (`Model::paginate()`): catalog is small and rarely changes; random page access is useful.
+- `GET /orders` — **cursor pagination** (`Model::cursorPaginate()`): append-only, grows indefinitely, clients typically page forward only.
+
+**Filtering for `GET /products`:**
+
+Supported query parameters: `?is_active=true&min_price=10&max_price=100&sort=price_asc`
+
+```php
+// ProductFilterRequest.php — validation
+public function rules(): array
+{
+    return [
+        'is_active' => ['nullable', 'boolean'],
+        'min_price' => ['nullable', 'numeric', 'min:0'],
+        'max_price' => ['nullable', 'numeric', 'min:0'],
+        'sort'      => ['nullable', Rule::in(['price_asc', 'price_desc', 'name_asc', 'created_desc'])],
+    ];
+}
+```
+
+Never allow arbitrary column names in `ORDER BY` — it is a SQL injection vector. Whitelist sortable columns explicitly.
+
+**Paginated response envelope:**
+
+```json
+{
+  "data": [
+    { "id": 1, "name": "Wireless Headphones", "price": 79.99, "stock": 14 }
+  ],
+  "meta": {
+    "current_page": 1,
+    "per_page": 20,
+    "total": 243,
+    "last_page": 13
+  },
+  "links": {
+    "first": "/api/products?page=1",
+    "last":  "/api/products?page=13",
+    "prev":  null,
+    "next":  "/api/products?page=2"
+  }
+}
+```
+
+Laravel's `paginate()` produces this envelope automatically when returned from a controller; `cursorPaginate()` produces `next`/`prev` cursor links instead of page numbers.
+
+---
+
+### Zero-Downtime Migration Strategy
+
+**The problem:** `ALTER TABLE orders ADD COLUMN ...` on a large table acquires a metadata lock that blocks all reads and writes for its duration. On a table with millions of rows, this can last minutes — downtime.
+
+**Safe migration patterns:**
+
+**1. Add a nullable column** (always safe):
+
+```php
+$table->string('notes')->nullable()->after('status');
+```
+
+Existing rows get `NULL`; application code reads the column with a fallback. No lock beyond the instant DDL.
+
+**2. Rename a column (3-step process — never rename directly):**
+
+```
+Step 1: Add new column (nullable)          → deploy code that writes to both columns
+Step 2: Backfill: UPDATE SET new = old     → deploy code that reads from new column only
+Step 3: Drop old column                    → deploy
+```
+
+A direct `RENAME COLUMN` breaks any old app container still running during a rolling deploy.
+
+**3. Add an index online (MySQL 8):**
+
+```sql
+CREATE INDEX idx_products_active_stock
+    ON products (is_active, stock)
+    ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+`ALGORITHM=INPLACE, LOCK=NONE` is MySQL 8 online DDL — the table remains readable and writable during index creation.
+
+**4. Drop a column (2-step process):**
+
+```
+Step 1: Deploy code that no longer reads/writes the column
+Step 2: DROP COLUMN in the next release
+```
+
+Dropping a column that code still references crashes the application.
+
+**Backwards-compatible deploys:** during a rolling deploy, old and new containers run simultaneously. Every migration must be compatible with *both* the current code version *and* the previous one.
+
+**Squashing migrations:** after the initial production release, merge all migrations into one baseline file using `php artisan schema:dump`. This creates `database/schema/mysql-schema.dump` (or an equivalent SQL file) that fresh test databases are built from, keeping `php artisan test` startup fast.
+
+**Forward-only preference:** avoid relying on `down()` migration methods in production. Rollbacks rarely work on real data (you cannot un-send an email, un-charge a card, or un-delete a row). Prefer a compensating forward migration instead.
+
+---
+
+### Architecture Decision Records (ADRs)
+
+**What an ADR is:** a short, structured document that captures a significant architectural decision — the context that forced the decision, the options considered, the decision made, and its consequences.
+
+**Why they matter:** code shows *what* was built; ADRs record *why*. Future teammates (and future-you) need the reasoning to avoid relitigating settled decisions or unknowingly reversing them.
+
+**ADR format (Nygard template):**
+
+```markdown
+# ADR-001: Use Sanctum over JWT for API authentication
+
+## Status
+Accepted
+
+## Context
+The API must authenticate both web clients (session-based) and mobile clients (token-based).
+A simple, revocable token mechanism is preferred over a full OAuth2 server.
+
+## Decision
+Use Laravel Sanctum. Tokens are stored in the `personal_access_tokens` table and are
+revocable at any time by deleting the row.
+
+## Alternatives considered
+- **JWT (e.g., `tymon/jwt-auth`):** tokens are stateless and cannot be revoked without a
+  denylist, adding complexity.
+- **Laravel Passport:** full OAuth2 implementation; significantly more complex than required
+  for a single first-party client.
+
+## Consequences
+- Token revocation requires a DB lookup on every request (acceptable at this scale).
+- Tokens do not expire automatically; expiry must be configured in `sanctum.php`.
+```
+
+**ADRs worth writing for this project:**
+
+| ADR | Decision | Section reference |
+|-----|----------|-------------------|
+| ADR-001 | Sanctum over JWT / Passport | §8 Authentication Flow |
+| ADR-002 | Persistent DB cart + Redis cache layer vs. session-only cart | §9 Cart Flow |
+| ADR-003 | Stock validated at checkout only — no reservation system | §10 Checkout Flow |
+| ADR-004 | Price snapshot taken at checkout, not stored in cart | §10 Checkout Flow |
+| ADR-005 | Pessimistic lock (`lockForUpdate`) over optimistic lock for stock decrement | §10 Checkout Flow |
+| ADR-006 | Actions pattern over a traditional Service layer | §18 Design Patterns |
+| ADR-007 | PHP native enums for state machines over State-pattern classes | §18 Design Patterns |
+
+**Storage convention:** place ADR files in `docs/adr/` as lightweight Markdown files (`ADR-001-sanctum.md`, etc.). Link the directory from this document and from the repo README so they are discoverable.
 
 ---
 
