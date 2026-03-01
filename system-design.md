@@ -21,6 +21,7 @@
 17. [Deployment](#deployment)
 18. [Design Patterns, SOLID, OOP & Programming Fundamentals](#design-patterns-solid-oop--programming-fundamentals)
 19. [Additional Engineering Practices](#additional-engineering-practices)
+20. [Implementation Roadmap](#implementation-roadmap)
 
 ---
 
@@ -3089,6 +3090,214 @@ revocable at any time by deleting the row.
 | ADR-007 | PHP native enums for state machines over State-pattern classes | §18 Design Patterns |
 
 **Storage convention:** place ADR files in `docs/adr/` as lightweight Markdown files (`ADR-001-sanctum.md`, etc.). Link the directory from this document and from the repo README so they are discoverable.
+
+---
+
+## Implementation Roadmap
+
+A sequential build guide: follow these phases in order and you will never wonder "what do I do next?". No new architecture is introduced here — every step references the section where the design lives.
+
+---
+
+### Phase 0 — Project Bootstrap
+
+One-time setup before writing any domain code.
+
+1. `composer create-project laravel/laravel .` (PHP 8.3, Laravel 11)
+2. Copy Docker files from §14 (Dockerfile, docker-compose.yml, nginx.conf, my.cnf, php.ini)
+3. `docker-compose up -d` — verify all containers healthy
+4. Copy `.env` defaults from §14 Step 6; set `APP_KEY`, `DB_*`, `REDIS_*`
+5. `php artisan key:generate`
+6. Install packages: `sanctum`, `stripe-php`, `debugbar` (dev), `pint` (dev), `phpstan` (dev)
+7. Publish Sanctum config; add `HasApiTokens` to `User`
+8. Confirm `GET /` returns 200 — environment is working
+
+---
+
+### Phase 1 — Database Layer
+
+Build the foundation everything else depends on.
+
+1. Write migrations in this order (respects FK dependencies):
+   - `users` (already exists from Laravel default — adjust columns per §5)
+   - `products`
+   - `carts`
+   - `cart_items` (FK → carts, products)
+   - `orders`
+   - `order_items` (FK → orders, products)
+   - `payments` (FK → orders)
+2. Add compound index `(is_active, stock)` on `products` (§19 Query Optimisation)
+3. Run `php artisan migrate`
+4. Write Eloquent models with relationships (§3):
+   - `User` → hasOne Cart, hasMany Orders
+   - `Product` (no relations needed at model level)
+   - `Cart` → belongsTo User, hasMany CartItems
+   - `CartItem` → belongsTo Cart, belongsTo Product
+   - `Order` → belongsTo User, hasMany OrderItems, hasOne Payment
+   - `OrderItem` → belongsTo Order, belongsTo Product
+   - `Payment` → belongsTo Order
+5. Write PHP enums: `OrderStatus`, `PaymentStatus` (§6)
+6. Write seeders: `ProductSeeder` (10 sample products), `DatabaseSeeder`
+7. `php artisan migrate --seed` — confirm data in DB
+
+**Reference:** §3 Domain Model, §5 Database Schema, §6 State Machines
+
+---
+
+### Phase 2 — Authentication
+
+Stateless token auth via Sanctum.
+
+1. `RegisterController` — `POST /auth/register` (§7, §8)
+2. `LoginController` — `POST /auth/login`; return `{token, user}`
+3. `LogoutController` — `POST /auth/logout`; revoke current token
+4. Apply rate limiting middleware (§13): 3/min register, 5/min login
+5. Write `AuthRequest` form requests for register + login (§13 Input Validation)
+6. **Test:** Feature test `AuthTest` — register, login, logout, duplicate email, wrong password (§15)
+
+**Reference:** §8 Authentication Flow, §13 Security, §15 Testing Step 4
+
+---
+
+### Phase 3 — Product Catalog
+
+Read-only endpoints; no auth required.
+
+1. `ProductController@index` — `GET /products` with offset pagination + filtering (§19 Pagination)
+   - `ProductFilterRequest`: `is_active`, `min_price`, `max_price`, `sort` (whitelisted)
+   - Eloquent scope chain; `paginate(20)`
+2. `ProductController@show` — `GET /products/{id}`
+3. **Test:** Feature test `ProductTest` — list, filter, show, 404 on missing
+
+**Reference:** §7 API Design (Endpoints), §19 API Pagination & Filtering
+
+---
+
+### Phase 4 — Cart
+
+Persistent cart with Redis caching; requires auth.
+
+1. `CartController` — all 5 cart endpoints (§7):
+   - `GET /cart` — eager-load `items.product` (§19 N+1)
+   - `POST /cart/items` — add/increment item
+   - `PUT /cart/items/{productId}` — update quantity
+   - `DELETE /cart/items/{productId}` — remove item
+   - `DELETE /cart` — clear cart
+2. Write `AddToCartAction`, `UpdateCartItemAction`, `RemoveCartItemAction`, `ClearCartAction` (§18 Actions pattern)
+3. Implement Redis cart caching (`cart:v1:{user_id}`, 1h TTL) with `Cache::lock()` stampede prevention (§9, §19 Caching)
+4. Custom exceptions: `EmptyCartException`, `CartItemNotFoundException` (§12)
+5. Rate limit: 30/min on cart routes (§13)
+6. **Test:** Feature test `CartTest` — add, update, remove, clear, 404 on missing item, cache invalidation
+
+**Reference:** §9 Cart Flow, §12 Error Handling, §18 Actions, §19 N+1 + Caching
+
+---
+
+### Phase 5 — Orders & Checkout
+
+The core business transaction; most complex step.
+
+1. `CreateOrderAction` — wraps entire order creation in `DB::transaction()`:
+   - Validate cart not empty
+   - `lockForUpdate()` on each product (§19 Transaction Isolation)
+   - Validate stock per item; throw `InsufficientStockException` if short
+   - Snapshot price from `products` table into `order_items` (§10 design decision)
+   - Decrement stock
+   - Create `Order` + `OrderItems`
+   - Clear cart
+2. `OrderController`:
+   - `POST /checkout` — delegates to `CreateOrderAction` then `ProcessPaymentAction`
+   - `GET /orders` — cursor paginated, eager-load `items.product` (§19)
+   - `GET /orders/{id}` — eager-load `items.product`
+3. Add `Idempotency-Key` middleware on `POST /checkout` (§19 Idempotency)
+4. Rate limit: 10/min on checkout (§13)
+5. **Test:** Feature test `CheckoutTest` + `OrderTest` — happy path, empty cart, insufficient stock, duplicate idempotency key
+
+**Reference:** §10 Checkout Flow, §19 Transaction Isolation + Idempotency + N+1
+
+---
+
+### Phase 6 — Payments
+
+Stripe integration; runs *after* order is committed.
+
+1. `PaymentGatewayInterface` + `StripeGateway` implementation (§18 Dependency Inversion)
+2. `ProcessPaymentAction`:
+   - Create Stripe `PaymentIntent` with `idempotencyKey` (§19)
+   - Set HTTP timeouts: connect 2s, read 10s (§19 Circuit Breaker)
+   - On success: create `Payment` record, update `Order.status → processing`
+   - On failure: update `Order.status → cancelled`; re-increment stock
+3. `PaymentController` — `POST /payments/webhook` (Stripe webhook, §11):
+   - Verify Stripe signature
+   - Handle `payment_intent.succeeded` → `Order.status = completed`
+   - Handle `payment_intent.payment_failed` → `Order.status = cancelled`
+4. Bind `PaymentGatewayInterface` in `AppServiceProvider`; mock in tests
+5. Circuit breaker wrapper on `StripeGateway` (§19 Graceful Degradation)
+6. **Test:** Feature test `PaymentTest` — mock Stripe, success path, failure path, webhook signature verification
+
+**Reference:** §11 Payment Flow, §18 Patterns, §19 Idempotency + Circuit Breaker
+
+---
+
+### Phase 7 — Events & Notifications
+
+Async side-effects; decoupled from transactions.
+
+1. `OrderPlaced` event (§18 Observer/Event pattern)
+2. `SendOrderConfirmationListener` — queued, sends email (§18 SRP note: email must not block checkout DB transaction)
+3. Register in `EventServiceProvider`
+4. Configure `QUEUE_CONNECTION=redis` in `.env`
+5. `queue` container already defined in docker-compose (§14 Step 5)
+6. `CorrelationIdMiddleware` — generate/propagate `X-Request-Id`; pass to dispatched jobs (§19 Logging)
+7. Configure JSON log formatter (§19 Structured Logging)
+8. **Test:** assert event dispatched in `CheckoutTest`; mock listener
+
+**Reference:** §18 Events & Listeners, §19 Structured Logging
+
+---
+
+### Phase 8 — Hardening & Cross-Cutting Concerns
+
+Polish and production-readiness for local dev.
+
+1. Global exception handler in `bootstrap/app.php` — map all custom exceptions to JSON responses (§12)
+2. `X-Request-Id` response header from `CorrelationIdMiddleware`
+3. `GET /health` endpoint — check DB + Redis + queue (§17)
+4. Review all controllers: confirm no business logic leaks out of Actions
+5. Run `./vendor/bin/pint` — fix code style
+6. Run `./vendor/bin/phpstan analyse --level=8` — fix all errors
+7. `php artisan test --parallel --coverage --min=80` — must pass
+
+**Reference:** §12 Error Handling, §13 Security, §17 Deployment, §19 Logging
+
+---
+
+### Phase 9 — Documentation & ADRs
+
+Write the ADR files now while decisions are fresh.
+
+1. Create `docs/adr/` directory
+2. Write the 7 ADR files listed in §19 (ADR-001 through ADR-007)
+3. Update `README.md` with: local setup commands, link to system-design.md, link to `docs/adr/`
+
+**Reference:** §19 Architecture Decision Records
+
+---
+
+### Summary Table
+
+| Phase | What you build | Key §§ |
+|-------|----------------|--------|
+| 0 | Project bootstrap, Docker, packages | §14 |
+| 1 | Migrations, models, enums, seeders | §3, §5, §6 |
+| 2 | Auth (register, login, logout) | §8, §13 |
+| 3 | Product listing + filtering + pagination | §7, §19 |
+| 4 | Cart CRUD + Redis caching | §9, §19 |
+| 5 | Checkout + order creation + stock lock | §10, §19 |
+| 6 | Stripe payment + webhook | §11, §19 |
+| 7 | Events, queues, logging | §18, §19 |
+| 8 | Exception handling, health, QA tools | §12, §17 |
+| 9 | ADRs, README | §19 |
 
 ---
 
